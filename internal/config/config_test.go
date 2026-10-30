@@ -30,6 +30,8 @@ proxy:
   keepalive: 15s
   max_conns: 1024
   idle_timeout: 0
+  apply_nft: true
+  local_client_prefix: "100.64.0.0/24"
 log:
   format: json
   level: info
@@ -64,6 +66,12 @@ func TestLoad(t *testing.T) {
 	}
 	if cfg.Proxy.IdleTimeout != 0 {
 		t.Errorf("Proxy.IdleTimeout = %v, want 0", cfg.Proxy.IdleTimeout)
+	}
+	if !cfg.Proxy.ApplyNft {
+		t.Error("Proxy.ApplyNft = false, want true")
+	}
+	if cfg.Proxy.LocalClientPrefix != "100.64.0.0/24" {
+		t.Errorf("Proxy.LocalClientPrefix = %q, want 100.64.0.0/24", cfg.Proxy.LocalClientPrefix)
 	}
 	if cfg.Log.Format != "json" || cfg.Log.Level != "info" {
 		t.Errorf("Log config = %+v", cfg.Log)
@@ -100,6 +108,29 @@ func TestExampleConfig(t *testing.T) {
 	}
 }
 
+func TestOpenWrtSampleConfig(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "files", "etc", "tesla-gateway", "config.yaml"))
+	if err != nil {
+		t.Fatalf("Load(OpenWrt sample) = %v, want nil", err)
+	}
+	if !cfg.Proxy.ApplyNft {
+		t.Error("Proxy.ApplyNft = false, want true")
+	}
+	if cfg.Proxy.LocalClientPrefix != "100.64.0.0/24" {
+		t.Errorf("Proxy.LocalClientPrefix = %q, want 100.64.0.0/24", cfg.Proxy.LocalClientPrefix)
+	}
+	if cfg.DNS.Listen != "0.0.0.0:53" {
+		t.Errorf("DNS.Listen = %q, want 0.0.0.0:53", cfg.DNS.Listen)
+	}
+	if cfg.Proxy.TCPListen != ":16464" {
+		t.Errorf("Proxy.TCPListen = %q, want :16464", cfg.Proxy.TCPListen)
+	}
+	got, ok := cfg.Strategy.Translate(mustAddr(t, "192.168.1.42"))
+	if !ok || got.String() != "100.64.1.42" {
+		t.Errorf("Translate(192.168.1.42) = %s, %v; want 100.64.1.42, true", got, ok)
+	}
+}
+
 func TestParseIntegerDurationsAndDefaults(t *testing.T) {
 	cfg, err := config.Parse([]byte(`
 mappings:
@@ -119,6 +150,32 @@ proxy:
 	}
 	if cfg.Proxy.IdleTimeout != 0 {
 		t.Errorf("IdleTimeout = %v, want 0", cfg.Proxy.IdleTimeout)
+	}
+	if cfg.Proxy.ApplyNft {
+		t.Error("ApplyNft = true, want default false")
+	}
+	if cfg.Proxy.LocalClientPrefix != config.DefaultLocalClientPrefix {
+		t.Errorf(
+			"LocalClientPrefix = %q, want default %q",
+			cfg.Proxy.LocalClientPrefix,
+			config.DefaultLocalClientPrefix,
+		)
+	}
+}
+
+func TestDefaultLocalClientPrefixWhenProxySectionMissing(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+mappings:
+  - { from: "10.0.0.0/24", to: "100.65.0.0/24" }
+`))
+	if err != nil {
+		t.Fatalf("Parse() = %v, want nil", err)
+	}
+	if cfg.Proxy.LocalClientPrefix != config.DefaultLocalClientPrefix {
+		t.Errorf("LocalClientPrefix = %q, want %q", cfg.Proxy.LocalClientPrefix, config.DefaultLocalClientPrefix)
+	}
+	if cfg.Proxy.ApplyNft {
+		t.Error("ApplyNft = true, want false")
 	}
 }
 

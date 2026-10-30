@@ -25,6 +25,11 @@ dns:
 proxy:
   mode: nat
   tcp_listen: ":16464"
+  # Keep false on a development machine. On OpenWrt, set true to install the
+  # nftables redirect rules automatically.
+  apply_nft: false
+  # Never redirect local Tesla clients. Empty uses 100.64.0.0/24.
+  local_client_prefix: "100.64.0.0/24"
   keepalive: 15s
   max_conns: 1024
   idle_timeout: 0

@@ -1,0 +1,35 @@
+# Tesla Gateway configuration for UFI003 (OpenWrt, aarch64).
+# Install as /etc/tesla-gateway/config.yaml.
+
+mapping_strategy: prefix
+
+mappings:
+  # Tesla sees 100.64.1.x, the real LAN host is 192.168.1.x.
+  - { from: "192.168.1.0/24", to: "100.64.1.0/24" }
+  # Add more real networks here; every "to" prefix must be unique:
+  # - { from: "100.68.0.0/16", to: "100.65.0.0/16" }   # Tailscale side
+  # - { from: "10.243.0.0/16",  to: "100.66.0.0/16" }  # ZeroTier side
+
+dns:
+  listen: "0.0.0.0:53"
+  resolvers: [hosts, lease, system]
+  upstream: ["223.5.5.5", "119.29.29.29"]
+  hosts_path: "/etc/hosts"
+  lease_path: "/tmp/dhcp.leases"
+  clamp_ttl: 300
+  cache_max: 4096
+  drop_aaaa: false
+
+proxy:
+  mode: nat
+  tcp_listen: ":16464"
+  apply_nft: true
+  # Never redirect Tesla clients themselves. This /24 stays local.
+  local_client_prefix: "100.64.0.0/24"
+  keepalive: 15s
+  max_conns: 1024
+  idle_timeout: 0
+
+log:
+  format: json
+  level: info

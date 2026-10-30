@@ -4,9 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -15,6 +18,7 @@ import (
 	"tesla-gateway/internal/dns/resolvers"
 	"tesla-gateway/internal/logx"
 	"tesla-gateway/internal/mapping"
+	"tesla-gateway/internal/netlink"
 	tgproxy "tesla-gateway/internal/proxy"
 )
 
@@ -125,7 +129,10 @@ func run() int {
 		})
 	}
 
-	var tcpProxy *tgproxy.TCPProxy
+	var (
+		tcpProxy   *tgproxy.TCPProxy
+		nftApplied bool
+	)
 	if strings.TrimSpace(cfg.Proxy.TCPListen) == "" {
 		logger.Warn("proxy.tcp_listen is empty; TCP transparent proxy is disabled", nil)
 	} else {
@@ -162,6 +169,69 @@ func run() int {
 		})
 	}
 
+	if cfg.Proxy.ApplyNft {
+		if tcpProxy == nil {
+			logger.Error("proxy.apply_nft is true but the TCP proxy is disabled; set proxy.tcp_listen", nil)
+			if server != nil {
+				_ = server.Close()
+			}
+			return 1
+		}
+
+		proxyPort, err := parseProxyPort(cfg.Proxy.TCPListen)
+		if err != nil {
+			logger.Error("failed to parse proxy.tcp_listen for nft", logx.Fields{
+				"error": err.Error(),
+			})
+			_ = tcpProxy.Stop()
+			if server != nil {
+				_ = server.Close()
+			}
+			return 1
+		}
+		localPrefix, err := netip.ParsePrefix(cfg.Proxy.LocalClientPrefix)
+		if err != nil {
+			logger.Error("failed to parse proxy.local_client_prefix", logx.Fields{
+				"prefix": cfg.Proxy.LocalClientPrefix,
+				"error":  err.Error(),
+			})
+			_ = tcpProxy.Stop()
+			if server != nil {
+				_ = server.Close()
+			}
+			return 1
+		}
+
+		ruleset, err := netlink.BuildRuleset(engine.MappedPrefixes(), proxyPort, localPrefix)
+		if err != nil {
+			logger.Error("failed to build nft ruleset", logx.Fields{
+				"error": err.Error(),
+			})
+			_ = tcpProxy.Stop()
+			if server != nil {
+				_ = server.Close()
+			}
+			return 1
+		}
+		if err := netlink.Apply(rootCtx, ruleset, nil); err != nil {
+			logger.Error("failed to apply nft rules", logx.Fields{
+				"error": err.Error(),
+			})
+			_ = tcpProxy.Stop()
+			if server != nil {
+				_ = server.Close()
+			}
+			return 1
+		}
+		nftApplied = true
+		logger.Info("nft rules applied", logx.Fields{
+			"table":               netlink.TableName,
+			"proxy_port":          proxyPort,
+			"local_client_prefix": localPrefix.String(),
+			"mapped_prefixes":     engine.MappedPrefixes(),
+		})
+	}
+
 	if server == nil && tcpProxy == nil {
 		logger.Warn("no service is enabled; set dns.listen and/or proxy.tcp_listen", nil)
 		return 0
@@ -191,6 +261,18 @@ func run() int {
 
 	cancelRoot()
 	exitCode := 0
+	if nftApplied {
+		if err := netlink.Cleanup(nil); err != nil {
+			logger.Error("failed to clean up nft rules", logx.Fields{
+				"error": err.Error(),
+			})
+			exitCode = 1
+		} else {
+			logger.Info("nft rules cleaned up", logx.Fields{
+				"table": netlink.TableName,
+			})
+		}
+	}
 	if tcpProxy != nil {
 		if err := tcpProxy.Stop(); err != nil {
 			logger.Error("failed to stop TCP proxy", logx.Fields{
@@ -253,6 +335,19 @@ func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine) (*dnsRuntime, e
 	}, nil
 }
 
+func parseProxyPort(listen string) (int, error) {
+	listen = strings.TrimSpace(listen)
+	_, rawPort, err := net.SplitHostPort(listen)
+	if err != nil {
+		return 0, fmt.Errorf("split %q: %w", listen, err)
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%q: invalid TCP port %q", listen, rawPort)
+	}
+	return port, nil
+}
+
 func reload(path string, current *config.Config, server *tgdns.Server, cache *tgdns.Cache, tcpProxy *tgproxy.TCPProxy, logger *logx.Logger) error {
 	next, err := config.Load(path)
 	if err != nil {
@@ -313,6 +408,15 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 			!reflect.DeepEqual(next.Mappings, current.Mappings) ||
 			!reflect.DeepEqual(next.RealPrefixes, current.RealPrefixes) {
 			logger.Warn("mapping rules changed; the TCP proxy keeps its startup mapping until restart", nil)
+		}
+		if next.Proxy.ApplyNft != current.Proxy.ApplyNft ||
+			next.Proxy.LocalClientPrefix != current.Proxy.LocalClientPrefix {
+			logger.Warn("nft settings changed; restart is required to reapply nft rules", logx.Fields{
+				"old_apply_nft":           current.Proxy.ApplyNft,
+				"new_apply_nft":           next.Proxy.ApplyNft,
+				"old_local_client_prefix": current.Proxy.LocalClientPrefix,
+				"new_local_client_prefix": next.Proxy.LocalClientPrefix,
+			})
 		}
 	}
 

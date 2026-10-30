@@ -16,6 +16,10 @@ import (
 // DefaultPath is the default configuration file path.
 const DefaultPath = "/etc/tesla-gateway/config.yaml"
 
+// DefaultLocalClientPrefix is the local Tesla client network. It is excluded
+// from the nftables redirect set so local clients are never intercepted.
+const DefaultLocalClientPrefix = "100.64.0.0/24"
+
 // Config is the top-level Tesla Gateway configuration.
 type Config struct {
 	// MappingStrategy selects the mapping implementation. Empty means prefix.
@@ -60,6 +64,13 @@ type ProxyConfig struct {
 	KeepAlive   time.Duration `yaml:"-"`
 	MaxConns    int           `yaml:"max_conns"`
 	IdleTimeout time.Duration `yaml:"-"`
+	// ApplyNft installs the nftables redirect rules at startup and removes
+	// them on shutdown. It is off by default so local development leaves the
+	// host firewall untouched.
+	ApplyNft bool `yaml:"apply_nft"`
+	// LocalClientPrefix is excluded from the nft redirect set. Empty uses
+	// DefaultLocalClientPrefix.
+	LocalClientPrefix string `yaml:"local_client_prefix"`
 }
 
 // LogConfig configures structured logging.
@@ -92,21 +103,32 @@ func Parse(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
+	cfg.Proxy.applyDefaults()
 	if err := cfg.compileMapping(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
+func (p *ProxyConfig) applyDefaults() {
+	if strings.TrimSpace(p.LocalClientPrefix) == "" {
+		p.LocalClientPrefix = DefaultLocalClientPrefix
+	} else {
+		p.LocalClientPrefix = strings.TrimSpace(p.LocalClientPrefix)
+	}
+}
+
 // UnmarshalYAML decodes ProxyConfig, accepting durations such as "15s" as well
 // as bare second counts such as 0.
 func (p *ProxyConfig) UnmarshalYAML(value *yaml.Node) error {
 	var raw struct {
-		Mode        string    `yaml:"mode"`
-		TCPListen   string    `yaml:"tcp_listen"`
-		KeepAlive   yaml.Node `yaml:"keepalive"`
-		MaxConns    int       `yaml:"max_conns"`
-		IdleTimeout yaml.Node `yaml:"idle_timeout"`
+		Mode              string    `yaml:"mode"`
+		TCPListen         string    `yaml:"tcp_listen"`
+		KeepAlive         yaml.Node `yaml:"keepalive"`
+		MaxConns          int       `yaml:"max_conns"`
+		IdleTimeout       yaml.Node `yaml:"idle_timeout"`
+		ApplyNft          bool      `yaml:"apply_nft"`
+		LocalClientPrefix string    `yaml:"local_client_prefix"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
@@ -122,12 +144,15 @@ func (p *ProxyConfig) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	*p = ProxyConfig{
-		Mode:        raw.Mode,
-		TCPListen:   raw.TCPListen,
-		KeepAlive:   keepAlive,
-		MaxConns:    raw.MaxConns,
-		IdleTimeout: idleTimeout,
+		Mode:              raw.Mode,
+		TCPListen:         raw.TCPListen,
+		KeepAlive:         keepAlive,
+		MaxConns:          raw.MaxConns,
+		IdleTimeout:       idleTimeout,
+		ApplyNft:          raw.ApplyNft,
+		LocalClientPrefix: strings.TrimSpace(raw.LocalClientPrefix),
 	}
+	p.applyDefaults()
 	return nil
 }
 
@@ -135,18 +160,22 @@ func (p *ProxyConfig) UnmarshalYAML(value *yaml.Node) error {
 // strings.
 func (p ProxyConfig) MarshalYAML() (any, error) {
 	type encoded struct {
-		Mode        string `yaml:"mode"`
-		TCPListen   string `yaml:"tcp_listen"`
-		KeepAlive   string `yaml:"keepalive"`
-		MaxConns    int    `yaml:"max_conns"`
-		IdleTimeout string `yaml:"idle_timeout"`
+		Mode              string `yaml:"mode"`
+		TCPListen         string `yaml:"tcp_listen"`
+		KeepAlive         string `yaml:"keepalive"`
+		MaxConns          int    `yaml:"max_conns"`
+		IdleTimeout       string `yaml:"idle_timeout"`
+		ApplyNft          bool   `yaml:"apply_nft"`
+		LocalClientPrefix string `yaml:"local_client_prefix"`
 	}
 	return encoded{
-		Mode:        p.Mode,
-		TCPListen:   p.TCPListen,
-		KeepAlive:   p.KeepAlive.String(),
-		MaxConns:    p.MaxConns,
-		IdleTimeout: p.IdleTimeout.String(),
+		Mode:              p.Mode,
+		TCPListen:         p.TCPListen,
+		KeepAlive:         p.KeepAlive.String(),
+		MaxConns:          p.MaxConns,
+		IdleTimeout:       p.IdleTimeout.String(),
+		ApplyNft:          p.ApplyNft,
+		LocalClientPrefix: p.LocalClientPrefix,
 	}, nil
 }
 
