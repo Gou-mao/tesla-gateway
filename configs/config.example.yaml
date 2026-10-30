@@ -1,0 +1,32 @@
+# Tesla Gateway example configuration.
+
+mapping_strategy: prefix
+
+mappings:
+  - { from: "192.168.1.0/24", to: "100.64.1.0/24" }
+  # - { from: "100.68.0.0/16", to: "100.65.0.0/16" }   # Tailscale side
+  # - { from: "10.243.0.0/16",  to: "100.66.0.0/16" }  # ZeroTier side
+
+# Real networks that are in use. Mapped (to) prefixes must not overlap these.
+# 100.64.0.0/24 is always reserved for local Tesla clients.
+real_prefixes:
+  - "192.168.0.0/16"
+
+dns:
+  listen: "0.0.0.0:53"
+  resolvers: [hosts, lease, system]
+  upstream: ["223.5.5.5", "119.29.29.29"]
+  clamp_ttl: 300
+  cache_max: 4096
+  drop_aaaa: false
+
+proxy:
+  mode: nat
+  tcp_listen: ":16464"
+  keepalive: 15s
+  max_conns: 1024
+  idle_timeout: 0
+
+log:
+  format: json
+  level: info
