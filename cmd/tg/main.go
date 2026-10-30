@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"reflect"
 	"strings"
 	"syscall"
 
@@ -13,6 +15,7 @@ import (
 	"tesla-gateway/internal/dns/resolvers"
 	"tesla-gateway/internal/logx"
 	"tesla-gateway/internal/mapping"
+	tgproxy "tesla-gateway/internal/proxy"
 )
 
 func main() {
@@ -71,50 +74,98 @@ func run() int {
 		"proxy_tcp_listen": cfg.Proxy.TCPListen,
 	})
 
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+
+	var (
+		server *tgdns.Server
+		cache  *tgdns.Cache
+	)
 	if strings.TrimSpace(cfg.DNS.Listen) == "" {
 		logger.Warn("dns.listen is empty; DNS service is disabled", nil)
+	} else {
+		cache = tgdns.NewCache(cfg.DNS.CacheMax)
+		runtime, err := buildDNSRuntime(cfg, engine)
+		if err != nil {
+			logger.Error("failed to build DNS resolver chain", logx.Fields{
+				"error": err.Error(),
+			})
+			return 1
+		}
+
+		server, err = tgdns.NewServer(tgdns.ServerConfig{
+			Listen:   cfg.DNS.Listen,
+			Local:    runtime.local,
+			Upstream: runtime.upstream,
+			Cache:    cache,
+			Rewriter: runtime.rewriter,
+			Logger:   logger.WithModule("dns"),
+		})
+		if err != nil {
+			logger.Error("failed to create DNS server", logx.Fields{
+				"error": err.Error(),
+			})
+			return 1
+		}
+		if err := server.Start(); err != nil {
+			logger.Error("failed to start DNS server", logx.Fields{
+				"error": err.Error(),
+			})
+			return 1
+		}
+		logger.Info("DNS server started", logx.Fields{
+			"listen":          server.Addr(),
+			"resolvers":       cfg.DNS.Resolvers,
+			"upstream":        cfg.DNS.Upstream,
+			"cache_max":       cfg.DNS.CacheMax,
+			"clamp_ttl":       cfg.DNS.ClampTTL,
+			"drop_aaaa":       cfg.DNS.DropAAAA,
+			"mapping_engine":  cfg.MappingStrategy,
+			"mapped_prefixes": engine.MappedPrefixes(),
+		})
+	}
+
+	var tcpProxy *tgproxy.TCPProxy
+	if strings.TrimSpace(cfg.Proxy.TCPListen) == "" {
+		logger.Warn("proxy.tcp_listen is empty; TCP transparent proxy is disabled", nil)
+	} else {
+		tcpProxy, err = tgproxy.NewTCPProxy(tgproxy.TCPConfig{
+			Listen:      cfg.Proxy.TCPListen,
+			KeepAlive:   cfg.Proxy.KeepAlive,
+			MaxConns:    cfg.Proxy.MaxConns,
+			IdleTimeout: cfg.Proxy.IdleTimeout,
+		}, engine, logger)
+		if err != nil {
+			if server != nil {
+				_ = server.Close()
+			}
+			logger.Error("failed to create TCP proxy", logx.Fields{
+				"error": err.Error(),
+			})
+			return 1
+		}
+		if err := tcpProxy.Start(rootCtx); err != nil {
+			if server != nil {
+				_ = server.Close()
+			}
+			logger.Error("failed to start TCP proxy", logx.Fields{
+				"error": err.Error(),
+			})
+			return 1
+		}
+		logger.Info("TCP proxy started", logx.Fields{
+			"listen":       tcpProxy.Addr(),
+			"mode":         cfg.Proxy.Mode,
+			"keepalive":    cfg.Proxy.KeepAlive,
+			"max_conns":    cfg.Proxy.MaxConns,
+			"idle_timeout": cfg.Proxy.IdleTimeout,
+		})
+	}
+
+	if server == nil && tcpProxy == nil {
+		logger.Warn("no service is enabled; set dns.listen and/or proxy.tcp_listen", nil)
 		return 0
 	}
-
-	cache := tgdns.NewCache(cfg.DNS.CacheMax)
-	runtime, err := buildDNSRuntime(cfg, engine)
-	if err != nil {
-		logger.Error("failed to build DNS resolver chain", logx.Fields{
-			"error": err.Error(),
-		})
-		return 1
-	}
-
-	server, err := tgdns.NewServer(tgdns.ServerConfig{
-		Listen:   cfg.DNS.Listen,
-		Local:    runtime.local,
-		Upstream: runtime.upstream,
-		Cache:    cache,
-		Rewriter: runtime.rewriter,
-		Logger:   logger.WithModule("dns"),
-	})
-	if err != nil {
-		logger.Error("failed to create DNS server", logx.Fields{
-			"error": err.Error(),
-		})
-		return 1
-	}
-	if err := server.Start(); err != nil {
-		logger.Error("failed to start DNS server", logx.Fields{
-			"error": err.Error(),
-		})
-		return 1
-	}
-	logger.Info("DNS server started", logx.Fields{
-		"listen":          server.Addr(),
-		"resolvers":       cfg.DNS.Resolvers,
-		"upstream":        cfg.DNS.Upstream,
-		"cache_max":       cfg.DNS.CacheMax,
-		"clamp_ttl":       cfg.DNS.ClampTTL,
-		"drop_aaaa":       cfg.DNS.DropAAAA,
-		"mapping_engine":  cfg.MappingStrategy,
-		"mapped_prefixes": engine.MappedPrefixes(),
-	})
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -123,7 +174,7 @@ func run() int {
 	for {
 		sig := <-sigCh
 		if sig == syscall.SIGHUP {
-			if err := reload(*configPath, cfg, server, cache, logger); err != nil {
+			if err := reload(*configPath, cfg, server, cache, tcpProxy, logger); err != nil {
 				logger.Error("configuration reload failed; keeping previous configuration", logx.Fields{
 					"config": *configPath,
 					"error":  err.Error(),
@@ -138,14 +189,26 @@ func run() int {
 		break
 	}
 
-	if err := server.Close(); err != nil {
-		logger.Error("failed to stop DNS server", logx.Fields{
-			"error": err.Error(),
-		})
-		return 1
+	cancelRoot()
+	exitCode := 0
+	if tcpProxy != nil {
+		if err := tcpProxy.Stop(); err != nil {
+			logger.Error("failed to stop TCP proxy", logx.Fields{
+				"error": err.Error(),
+			})
+			exitCode = 1
+		}
+	}
+	if server != nil {
+		if err := server.Close(); err != nil {
+			logger.Error("failed to stop DNS server", logx.Fields{
+				"error": err.Error(),
+			})
+			exitCode = 1
+		}
 	}
 	logger.Info("tesla-gateway stopped", nil)
-	return 0
+	return exitCode
 }
 
 type dnsRuntime struct {
@@ -190,7 +253,7 @@ func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine) (*dnsRuntime, e
 	}, nil
 }
 
-func reload(path string, current *config.Config, server *tgdns.Server, cache *tgdns.Cache, logger *logx.Logger) error {
+func reload(path string, current *config.Config, server *tgdns.Server, cache *tgdns.Cache, tcpProxy *tgproxy.TCPProxy, logger *logx.Logger) error {
 	next, err := config.Load(path)
 	if err != nil {
 		return err
@@ -201,9 +264,12 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 		return err
 	}
 
-	runtime, err := buildDNSRuntime(next, engine)
-	if err != nil {
-		return err
+	var runtime *dnsRuntime
+	if server != nil {
+		runtime, err = buildDNSRuntime(next, engine)
+		if err != nil {
+			return err
+		}
 	}
 
 	if next.DNS.Listen != current.DNS.Listen {
@@ -219,11 +285,46 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 		})
 	}
 
-	server.Reload(runtime.local, runtime.upstream, runtime.rewriter)
-	cache.Clear()
+	// TCP proxy listeners and mapping engines are intentionally not rebuilt on
+	// SIGHUP. DNS reloads in place; proxy changes require a restart.
+	if tcpProxy != nil {
+		if next.Proxy.TCPListen != current.Proxy.TCPListen {
+			logger.Warn("proxy.tcp_listen changed; restart is required to move the listener", logx.Fields{
+				"old": current.Proxy.TCPListen,
+				"new": next.Proxy.TCPListen,
+			})
+		}
+		if next.Proxy.Mode != current.Proxy.Mode ||
+			next.Proxy.KeepAlive != current.Proxy.KeepAlive ||
+			next.Proxy.MaxConns != current.Proxy.MaxConns ||
+			next.Proxy.IdleTimeout != current.Proxy.IdleTimeout {
+			logger.Warn("proxy settings changed; restart is required to apply them", logx.Fields{
+				"old_mode":         current.Proxy.Mode,
+				"new_mode":         next.Proxy.Mode,
+				"old_keepalive":    current.Proxy.KeepAlive.String(),
+				"new_keepalive":    next.Proxy.KeepAlive.String(),
+				"old_max_conns":    current.Proxy.MaxConns,
+				"new_max_conns":    next.Proxy.MaxConns,
+				"old_idle_timeout": current.Proxy.IdleTimeout.String(),
+				"new_idle_timeout": next.Proxy.IdleTimeout.String(),
+			})
+		}
+		if next.MappingStrategy != current.MappingStrategy ||
+			!reflect.DeepEqual(next.Mappings, current.Mappings) ||
+			!reflect.DeepEqual(next.RealPrefixes, current.RealPrefixes) {
+			logger.Warn("mapping rules changed; the TCP proxy keeps its startup mapping until restart", nil)
+		}
+	}
+
+	if server != nil {
+		server.Reload(runtime.local, runtime.upstream, runtime.rewriter)
+		if cache != nil {
+			cache.Clear()
+		}
+	}
 	*current = *next
 
-	logger.Info("configuration reloaded; DNS cache cleared", logx.Fields{
+	logger.Info("configuration reloaded", logx.Fields{
 		"config":    path,
 		"resolvers": current.DNS.Resolvers,
 		"upstream":  current.DNS.Upstream,
