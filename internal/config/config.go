@@ -45,9 +45,12 @@ type DNSConfig struct {
 	Listen    string   `yaml:"listen"`
 	Resolvers []string `yaml:"resolvers"`
 	Upstream  []string `yaml:"upstream"`
-	ClampTTL  int      `yaml:"clamp_ttl"`
-	CacheMax  int      `yaml:"cache_max"`
-	DropAAAA  bool     `yaml:"drop_aaaa"`
+	// HostsPath and LeasePath default to /etc/hosts and /tmp/dhcp.leases.
+	HostsPath string `yaml:"hosts_path"`
+	LeasePath string `yaml:"lease_path"`
+	ClampTTL  int    `yaml:"clamp_ttl"`
+	CacheMax  int    `yaml:"cache_max"`
+	DropAAAA  bool   `yaml:"drop_aaaa"`
 }
 
 // ProxyConfig configures the transparent proxy.

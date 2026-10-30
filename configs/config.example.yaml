@@ -16,6 +16,8 @@ dns:
   listen: "0.0.0.0:53"
   resolvers: [hosts, lease, system]
   upstream: ["223.5.5.5", "119.29.29.29"]
+  hosts_path: "/etc/hosts"
+  lease_path: "/tmp/dhcp.leases"
   clamp_ttl: 300
   cache_max: 4096
   drop_aaaa: false
