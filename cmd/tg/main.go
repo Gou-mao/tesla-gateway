@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"tesla-gateway/internal/config"
@@ -88,15 +89,16 @@ func run() int {
 	defer cancelRoot()
 
 	var (
-		server *tgdns.Server
-		cache  *tgdns.Cache
+		server          *tgdns.Server
+		cache           *tgdns.Cache
+		dnsRuntimeState atomic.Pointer[dnsRuntime]
 	)
 	if strings.TrimSpace(cfg.DNS.Listen) == "" {
 		logger.Warn("dns.listen is empty; DNS service is disabled", nil)
 	} else {
 		cache = tgdns.NewCache(cfg.DNS.CacheMax)
 		runtimeStats.SetCache(cache)
-		runtime, err := buildDNSRuntime(cfg, engine)
+		runtime, err := buildDNSRuntime(cfg, engine, logger)
 		if err != nil {
 			logger.Error("failed to build DNS resolver chain", logx.Fields{
 				"error": err.Error(),
@@ -125,6 +127,7 @@ func run() int {
 			})
 			return 1
 		}
+		dnsRuntimeState.Store(runtime)
 		logger.Info("DNS server started", logx.Fields{
 			"listen":          server.Addr(),
 			"resolvers":       cfg.DNS.Resolvers,
@@ -258,6 +261,13 @@ func run() int {
 	statsWriter, err := stats.NewWriter(stats.WriterConfig{
 		Path: cfg.StatsPath,
 		Meta: statsMeta(cfg, version, listeners),
+		EffectiveUpstream: func() []string {
+			runtime := dnsRuntimeState.Load()
+			if runtime == nil || runtime.system == nil {
+				return nil
+			}
+			return runtime.system.EffectiveUpstreams()
+		},
 	}, runtimeStats, logger.WithModule("stats"))
 	if err != nil {
 		// Stats publication is best-effort; it must never prevent the gateway
@@ -286,7 +296,7 @@ func run() int {
 	for {
 		sig := <-sigCh
 		if sig == syscall.SIGHUP {
-			if err := reload(*configPath, cfg, server, cache, tcpProxy, logger); err != nil {
+			if err := reload(*configPath, cfg, server, cache, tcpProxy, &dnsRuntimeState, logger); err != nil {
 				logger.Error("configuration reload failed; keeping previous configuration", logx.Fields{
 					"config": *configPath,
 					"error":  err.Error(),
@@ -352,13 +362,27 @@ func statsMeta(cfg *config.Config, version string, listeners stats.Listeners) st
 	upstream := make([]string, 0, len(cfg.DNS.Upstream))
 	upstream = append(upstream, cfg.DNS.Upstream...)
 
+	// Static fallback for configurations without a live system resolver. When
+	// DNS is running, the writer replaces this with the resolver's current
+	// effective list, including any DHCP expansion.
+	effective := make([]string, 0, len(cfg.DNS.Upstream))
+	for _, raw := range cfg.DNS.Upstream {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "dhcp", "auto":
+			continue
+		default:
+			effective = append(effective, strings.TrimSpace(raw))
+		}
+	}
+
 	return stats.Meta{
-		Version:         version,
-		Listeners:       listeners,
-		Mappings:        mappings,
-		MappingStrategy: cfg.MappingStrategy,
-		DNSListen:       cfg.DNS.Listen,
-		DNSUpstream:     upstream,
+		Version:              version,
+		Listeners:            listeners,
+		Mappings:             mappings,
+		MappingStrategy:      cfg.MappingStrategy,
+		DNSListen:            cfg.DNS.Listen,
+		DNSUpstream:          upstream,
+		DNSUpstreamEffective: effective,
 	}
 }
 
@@ -366,9 +390,10 @@ type dnsRuntime struct {
 	local    tgdns.Resolver
 	upstream tgdns.Resolver
 	rewriter *tgdns.Rewriter
+	system   *resolvers.SystemResolver
 }
 
-func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine) (*dnsRuntime, error) {
+func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine, logger *logx.Logger) (*dnsRuntime, error) {
 	names := cfg.DNS.Resolvers
 	if len(names) == 0 {
 		names = []string{"hosts", "lease", "system"}
@@ -376,6 +401,7 @@ func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine) (*dnsRuntime, e
 
 	local := make([]tgdns.Resolver, 0, len(names))
 	var upstream tgdns.Resolver
+	var system *resolvers.SystemResolver
 
 	for _, raw := range names {
 		switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -387,7 +413,11 @@ func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine) (*dnsRuntime, e
 			if upstream != nil {
 				return nil, fmt.Errorf("dns: resolver %q is configured more than once", raw)
 			}
-			system, err := resolvers.NewSystemResolver(cfg.DNS.Upstream)
+			var err error
+			system, err = resolvers.NewSystemResolver(
+				cfg.DNS.Upstream,
+				resolvers.WithSystemLogger(logger.WithModule("dns-upstream")),
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -401,6 +431,7 @@ func buildDNSRuntime(cfg *config.Config, engine *mapping.Engine) (*dnsRuntime, e
 		local:    resolvers.NewChain(local...),
 		upstream: upstream,
 		rewriter: tgdns.NewRewriter(engine, cfg.DNS.ClampTTL, cfg.DNS.DropAAAA),
+		system:   system,
 	}, nil
 }
 
@@ -417,7 +448,7 @@ func parseProxyPort(listen string) (int, error) {
 	return port, nil
 }
 
-func reload(path string, current *config.Config, server *tgdns.Server, cache *tgdns.Cache, tcpProxy *tgproxy.TCPProxy, logger *logx.Logger) error {
+func reload(path string, current *config.Config, server *tgdns.Server, cache *tgdns.Cache, tcpProxy *tgproxy.TCPProxy, dnsRuntimeState *atomic.Pointer[dnsRuntime], logger *logx.Logger) error {
 	next, err := config.Load(path)
 	if err != nil {
 		return err
@@ -430,7 +461,7 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 
 	var runtime *dnsRuntime
 	if server != nil {
-		runtime, err = buildDNSRuntime(next, engine)
+		runtime, err = buildDNSRuntime(next, engine, logger)
 		if err != nil {
 			return err
 		}
@@ -497,6 +528,9 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 
 	if server != nil {
 		server.Reload(runtime.local, runtime.upstream, runtime.rewriter)
+		if dnsRuntimeState != nil {
+			dnsRuntimeState.Store(runtime)
+		}
 		if cache != nil {
 			cache.Clear()
 		}

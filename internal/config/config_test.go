@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ stats_path: "/tmp/tesla-gateway-stats.json"
 dns:
   listen: "0.0.0.0:53"
   resolvers: [hosts, lease, system]
-  upstream: ["223.5.5.5", "119.29.29.29"]
+  upstream: ["223.5.5.5", "dhcp", "119.29.29.29"]
   clamp_ttl: 300
   cache_max: 4096
   drop_aaaa: false
@@ -65,6 +66,15 @@ func TestLoad(t *testing.T) {
 	if len(cfg.DNS.Resolvers) != 3 || cfg.DNS.Resolvers[2] != "system" {
 		t.Errorf("DNS.Resolvers = %v", cfg.DNS.Resolvers)
 	}
+	wantUpstream := []string{"223.5.5.5", "dhcp", "119.29.29.29"}
+	if len(cfg.DNS.Upstream) != len(wantUpstream) {
+		t.Fatalf("DNS.Upstream = %v, want %v", cfg.DNS.Upstream, wantUpstream)
+	}
+	for i := range wantUpstream {
+		if cfg.DNS.Upstream[i] != wantUpstream[i] {
+			t.Errorf("DNS.Upstream[%d] = %q, want %q", i, cfg.DNS.Upstream[i], wantUpstream[i])
+		}
+	}
 	if cfg.Proxy.KeepAlive != 15*time.Second {
 		t.Errorf("Proxy.KeepAlive = %v, want 15s", cfg.Proxy.KeepAlive)
 	}
@@ -89,6 +99,117 @@ func TestLoad(t *testing.T) {
 	got, ok := cfg.Strategy.Translate(mustAddr(t, "192.168.1.42"))
 	if !ok || got.String() != "100.64.1.42" {
 		t.Errorf("Translate(192.168.1.42) = %s, %v; want 100.64.1.42, true", got, ok)
+	}
+}
+
+func TestParseOrderedUpstreamWithDHCP(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream string
+		want     []string
+	}{
+		{
+			name:     "dhcp only",
+			upstream: `["dhcp"]`,
+			want:     []string{"dhcp"},
+		},
+		{
+			name:     "auto alias and mixed families",
+			upstream: `["auto", "223.5.5.5", "2001:4860:4860::8888"]`,
+			want:     []string{"auto", "223.5.5.5", "2001:4860:4860::8888"},
+		},
+		{
+			name:     "priority order is preserved",
+			upstream: `["dhcp", "223.5.5.5", "119.29.29.29"]`,
+			want:     []string{"dhcp", "223.5.5.5", "119.29.29.29"},
+		},
+		{
+			name:     "keyword is case insensitive and trimmed",
+			upstream: `[" DHCP ", "auto"]`,
+			want:     []string{"DHCP", "auto"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := config.Parse([]byte(`
+mappings:
+  - { from: "10.0.0.0/24", to: "100.65.0.0/24" }
+dns:
+  upstream: ` + tc.upstream + `
+`))
+			if err != nil {
+				t.Fatalf("Parse() = %v, want nil", err)
+			}
+			if !reflect.DeepEqual(cfg.DNS.Upstream, tc.want) {
+				t.Errorf("DNS.Upstream = %v, want %v", cfg.DNS.Upstream, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidUpstream(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream string
+		want     string
+	}{
+		{
+			name:     "explicit empty list",
+			upstream: `[]`,
+			want:     "at least one",
+		},
+		{
+			name:     "empty item",
+			upstream: `["223.5.5.5", ""]`,
+			want:     "dns.upstream[1]",
+		},
+		{
+			name:     "hostname is not allowed",
+			upstream: `["dns.example.com"]`,
+			want:     "dns.upstream[0]",
+		},
+		{
+			name:     "port is not allowed",
+			upstream: `["1.1.1.1:53"]`,
+			want:     "dns.upstream[0]",
+		},
+		{
+			name:     "malformed address",
+			upstream: `["2001::not-an-address"]`,
+			want:     "dns.upstream[0]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Parse([]byte(`
+mappings:
+  - { from: "10.0.0.0/24", to: "100.65.0.0/24" }
+dns:
+  listen: "127.0.0.1:5353"
+  upstream: ` + tc.upstream + `
+`))
+			if err == nil {
+				t.Fatal("Parse() = nil, want error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Parse() = %q, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseOmittedUpstreamAllowedWhenDNSDisabled(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+mappings:
+  - { from: "10.0.0.0/24", to: "100.65.0.0/24" }
+`))
+	if err != nil {
+		t.Fatalf("Parse() = %v, want nil", err)
+	}
+	if len(cfg.DNS.Upstream) != 0 {
+		t.Errorf("DNS.Upstream = %v, want empty", cfg.DNS.Upstream)
 	}
 }
 

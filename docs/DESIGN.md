@@ -198,7 +198,8 @@ mappings:
 dns:
   listen: "0.0.0.0:53"
   resolvers: [hosts, lease, system]        # 依序; 预留 tailscale/zerotier/mdns
-  upstream: ["223.5.5.5","119.29.29.29"]
+  # 有序优先级：IPv4/IPv6 或 dhcp（别名 auto，按当前上游接口 DHCP DNS 原地展开）
+  upstream: ["dhcp", "223.5.5.5","119.29.29.29"]
   clamp_ttl: 300
   cache_max: 4096
   drop_aaaa: false

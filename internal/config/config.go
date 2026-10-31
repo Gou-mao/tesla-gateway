@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -44,6 +45,10 @@ type Config struct {
 
 	// Strategy is compiled and validated by Load. It is not part of YAML.
 	Strategy mapping.MappingStrategy `yaml:"-"`
+
+	// dnsUpstreamSet records whether dns.upstream was present in the YAML,
+	// even when it was an explicit empty list.
+	dnsUpstreamSet bool
 }
 
 // Mapping is one real-to-mapped prefix pair in CIDR notation.
@@ -56,7 +61,10 @@ type Mapping struct {
 type DNSConfig struct {
 	Listen    string   `yaml:"listen"`
 	Resolvers []string `yaml:"resolvers"`
-	Upstream  []string `yaml:"upstream"`
+	// Upstream is an ordered priority list. Each item is either an IPv4/IPv6
+	// address or the keyword "dhcp" (alias "auto"), which expands in place to
+	// the DNS servers currently handed out by DHCP on the upstream interface.
+	Upstream []string `yaml:"upstream"`
 	// HostsPath and LeasePath default to /etc/hosts and /tmp/dhcp.leases.
 	HostsPath string `yaml:"hosts_path"`
 	LeasePath string `yaml:"lease_path"`
@@ -111,15 +119,76 @@ func Parse(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
+	cfg.dnsUpstreamSet = dnsUpstreamPresent(data)
 	cfg.StatsPath = strings.TrimSpace(cfg.StatsPath)
 	if cfg.StatsPath == "" {
 		cfg.StatsPath = DefaultStatsPath
 	}
 	cfg.Proxy.applyDefaults()
+	if err := cfg.validateDNSUpstream(); err != nil {
+		return nil, err
+	}
 	if err := cfg.compileMapping(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// dnsUpstreamPresent reports whether the YAML document explicitly contains
+// dns.upstream. This lets an omitted list stay optional for configurations
+// that disable DNS, while an explicit empty list is still rejected.
+func dnsUpstreamPresent(data []byte) bool {
+	var document struct {
+		DNS struct {
+			Upstream yaml.Node `yaml:"upstream"`
+		} `yaml:"dns"`
+	}
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return false
+	}
+	return document.DNS.Upstream.Kind != 0
+}
+
+func isDHCPUpstream(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "dhcp", "auto":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Config) validateDNSUpstream() error {
+	if len(c.DNS.Upstream) == 0 {
+		// An explicit empty list is always invalid. An omitted list is only
+		// required when the DNS listener is enabled.
+		if c.dnsUpstreamSet || strings.TrimSpace(c.DNS.Listen) != "" {
+			return errors.New(`dns.upstream: at least one IPv4/IPv6 address or "dhcp" is required`)
+		}
+		return nil
+	}
+
+	valid := 0
+	for i, raw := range c.DNS.Upstream {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return fmt.Errorf(`dns.upstream[%d]: empty item; use an IPv4/IPv6 address or "dhcp"`, i)
+		}
+		if !isDHCPUpstream(value) {
+			if _, err := netip.ParseAddr(value); err != nil {
+				return fmt.Errorf(
+					`dns.upstream[%d] %q: must be an IPv4/IPv6 address or "dhcp" (alias "auto"): %w`,
+					i, raw, err,
+				)
+			}
+		}
+		c.DNS.Upstream[i] = value
+		valid++
+	}
+	if valid == 0 {
+		return errors.New(`dns.upstream: at least one IPv4/IPv6 address or "dhcp" is required`)
+	}
+	return nil
 }
 
 func (p *ProxyConfig) applyDefaults() {

@@ -42,12 +42,13 @@ type Mapping struct {
 // counters. It contains no secrets and changes only when the process restarts
 // with a different configuration.
 type Meta struct {
-	Version         string    `json:"version"`
-	Listeners       Listeners `json:"listeners"`
-	Mappings        []Mapping `json:"mappings"`
-	MappingStrategy string    `json:"mapping_strategy"`
-	DNSListen       string    `json:"dns_listen"`
-	DNSUpstream     []string  `json:"dns_upstream"`
+	Version              string    `json:"version"`
+	Listeners            Listeners `json:"listeners"`
+	Mappings             []Mapping `json:"mappings"`
+	MappingStrategy      string    `json:"mapping_strategy"`
+	DNSListen            string    `json:"dns_listen"`
+	DNSUpstream          []string  `json:"dns_upstream"`
+	DNSUpstreamEffective []string  `json:"dns_upstream_effective"`
 }
 
 // WriterConfig configures a stats file Writer.
@@ -62,22 +63,28 @@ type WriterConfig struct {
 	StartedAt time.Time
 	// Meta is the static configuration metadata merged into every snapshot.
 	Meta Meta
+	// EffectiveUpstream optionally reports the resolver's current effective
+	// upstream IP list. It is called on every write so DHCP expansions are
+	// reflected without a restart. When nil, Meta.DNSUpstreamEffective is
+	// published as-is.
+	EffectiveUpstream func() []string
 }
 
 // FileSnapshot is the top-level JSON document written by Writer. The static
 // meta fields and the dynamic DNS/proxy counters are merged into one object.
 type FileSnapshot struct {
-	Version         string        `json:"version"`
-	PID             int           `json:"pid"`
-	StartedAt       string        `json:"started_at"`
-	UptimeSec       int64         `json:"uptime_sec"`
-	Listeners       Listeners     `json:"listeners"`
-	Mappings        []Mapping     `json:"mappings"`
-	MappingStrategy string        `json:"mapping_strategy"`
-	DNSListen       string        `json:"dns_listen"`
-	DNSUpstream     []string      `json:"dns_upstream"`
-	DNS             DNSSnapshot   `json:"dns"`
-	Proxy           ProxySnapshot `json:"proxy"`
+	Version              string        `json:"version"`
+	PID                  int           `json:"pid"`
+	StartedAt            string        `json:"started_at"`
+	UptimeSec            int64         `json:"uptime_sec"`
+	Listeners            Listeners     `json:"listeners"`
+	Mappings             []Mapping     `json:"mappings"`
+	MappingStrategy      string        `json:"mapping_strategy"`
+	DNSListen            string        `json:"dns_listen"`
+	DNSUpstream          []string      `json:"dns_upstream"`
+	DNSUpstreamEffective []string      `json:"dns_upstream_effective"`
+	DNS                  DNSSnapshot   `json:"dns"`
+	Proxy                ProxySnapshot `json:"proxy"`
 }
 
 // Writer periodically publishes Stats as a JSON file. Writes are serialized and
@@ -142,6 +149,10 @@ func normalizeMeta(meta Meta) Meta {
 	upstream = append(upstream, meta.DNSUpstream...)
 	meta.DNSUpstream = upstream
 
+	effective := make([]string, 0, len(meta.DNSUpstreamEffective))
+	effective = append(effective, meta.DNSUpstreamEffective...)
+	meta.DNSUpstreamEffective = effective
+
 	return meta
 }
 
@@ -179,18 +190,25 @@ func (w *Writer) Write() error {
 		uptime = 0
 	}
 
+	effectiveUpstream := w.cfg.Meta.DNSUpstreamEffective
+	if w.cfg.EffectiveUpstream != nil {
+		effectiveUpstream = w.cfg.EffectiveUpstream()
+	}
+	effectiveUpstream = append([]string{}, effectiveUpstream...)
+
 	document := FileSnapshot{
-		Version:         w.cfg.Meta.Version,
-		PID:             w.cfg.PID,
-		StartedAt:       w.cfg.StartedAt.UTC().Format(time.RFC3339),
-		UptimeSec:       uptime,
-		Listeners:       w.cfg.Meta.Listeners,
-		Mappings:        append([]Mapping{}, w.cfg.Meta.Mappings...),
-		MappingStrategy: w.cfg.Meta.MappingStrategy,
-		DNSListen:       w.cfg.Meta.DNSListen,
-		DNSUpstream:     append([]string{}, w.cfg.Meta.DNSUpstream...),
-		DNS:             snapshot.DNS,
-		Proxy:           snapshot.Proxy,
+		Version:              w.cfg.Meta.Version,
+		PID:                  w.cfg.PID,
+		StartedAt:            w.cfg.StartedAt.UTC().Format(time.RFC3339),
+		UptimeSec:            uptime,
+		Listeners:            w.cfg.Meta.Listeners,
+		Mappings:             append([]Mapping{}, w.cfg.Meta.Mappings...),
+		MappingStrategy:      w.cfg.Meta.MappingStrategy,
+		DNSListen:            w.cfg.Meta.DNSListen,
+		DNSUpstream:          append([]string{}, w.cfg.Meta.DNSUpstream...),
+		DNSUpstreamEffective: effectiveUpstream,
+		DNS:                  snapshot.DNS,
+		Proxy:                snapshot.Proxy,
 	}
 
 	data, err := json.Marshal(document)

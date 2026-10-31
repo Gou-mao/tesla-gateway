@@ -462,6 +462,7 @@ return view.extend({
 		refs.dhcpRouter = E('span', {}, [ _('—') ]);
 		refs.dnsListen = E('span', {}, [ _('—') ]);
 		refs.dnsUpstream = E('span', {}, [ _('—') ]);
+		refs.dnsUpstreamEffective = E('span', {}, [ _('—') ]);
 		refs.mappingStrategy = E('span', {}, [ _('—') ]);
 		refs.queries = E('span', {}, [ _('—') ]);
 		refs.hits = E('span', {}, [ _('—') ]);
@@ -588,6 +589,8 @@ return view.extend({
 
 			var upstream = currentStats && Array.isArray(currentStats.dns_upstream)
 				? currentStats.dns_upstream : [];
+			var upstreamEffective = currentStats && Array.isArray(currentStats.dns_upstream_effective)
+				? currentStats.dns_upstream_effective : [];
 
 			refs.dnsListen.textContent = currentStats
 				? (currentStats.dns_listen || listeners.dns || _('禁用'))
@@ -595,6 +598,11 @@ return view.extend({
 			refs.dnsUpstream.textContent = upstream.length
 				? upstream.join(', ')
 				: (currentStats ? _('未配置') : _('—'));
+			refs.dnsUpstreamEffective.textContent = currentStats
+				? (upstreamEffective.length
+					? upstreamEffective.join(', ')
+					: _('无（dhcp 未解析到地址）'))
+				: _('—');
 			refs.mappingStrategy.textContent = currentStats
 				? formatStrategy(currentStats.mapping_strategy)
 				: _('—');
@@ -754,7 +762,8 @@ return view.extend({
 
 		var dnsTable = table([
 			tableRow(_('监听地址'), refs.dnsListen),
-			tableRow(_('上游服务器'), refs.dnsUpstream),
+			tableRow(_('上游服务器（配置）'), refs.dnsUpstream),
+			tableRow(_('上游服务器（实际生效）'), refs.dnsUpstreamEffective),
 			tableRow(_('映射策略'), refs.mappingStrategy)
 		]);
 

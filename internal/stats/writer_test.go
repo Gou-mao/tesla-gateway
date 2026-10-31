@@ -42,6 +42,7 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 	st.IncProxyRejectedNoMapping()
 
 	started := time.Now().UTC().Add(-90 * time.Second).Truncate(time.Second)
+	effectiveUpstream := []string{"223.5.5.5", "8.8.8.8"}
 	writer, err := stats.NewWriter(stats.WriterConfig{
 		Path:      path,
 		PID:       4242,
@@ -58,8 +59,9 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 			},
 			MappingStrategy: "prefix",
 			DNSListen:       "0.0.0.0:53",
-			DNSUpstream:     []string{"223.5.5.5", "119.29.29.29"},
+			DNSUpstream:     []string{"223.5.5.5", "dhcp"},
 		},
+		EffectiveUpstream: func() []string { return effectiveUpstream },
 	}, st, nil)
 	if err != nil {
 		t.Fatalf("NewWriter() = %v", err)
@@ -112,13 +114,25 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 			t.Errorf("mappings[%d] = %+v, want %+v", i, document.Mappings[i], wantMappings[i])
 		}
 	}
-	wantUpstream := []string{"223.5.5.5", "119.29.29.29"}
+	wantUpstream := []string{"223.5.5.5", "dhcp"}
 	if len(document.DNSUpstream) != len(wantUpstream) {
 		t.Fatalf("dns_upstream = %v, want %v", document.DNSUpstream, wantUpstream)
 	}
 	for i := range wantUpstream {
 		if document.DNSUpstream[i] != wantUpstream[i] {
 			t.Errorf("dns_upstream[%d] = %q, want %q", i, document.DNSUpstream[i], wantUpstream[i])
+		}
+	}
+	wantEffective := []string{"223.5.5.5", "8.8.8.8"}
+	if len(document.DNSUpstreamEffective) != len(wantEffective) {
+		t.Fatalf("dns_upstream_effective = %v, want %v", document.DNSUpstreamEffective, wantEffective)
+	}
+	for i := range wantEffective {
+		if document.DNSUpstreamEffective[i] != wantEffective[i] {
+			t.Errorf(
+				"dns_upstream_effective[%d] = %q, want %q",
+				i, document.DNSUpstreamEffective[i], wantEffective[i],
+			)
 		}
 	}
 	if got := document.DNS.Queries; got != 1 {
@@ -151,11 +165,23 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 
 	// The file is replaced atomically on every write.
 	st.IncDNSQueries()
+	effectiveUpstream = []string{"223.5.5.5", "1.1.1.1"}
 	if err := writer.Write(); err != nil {
 		t.Fatalf("second Write() = %v", err)
 	}
-	if got := readFileSnapshot(t, path).DNS.Queries; got != 2 {
+	second := readFileSnapshot(t, path)
+	if got := second.DNS.Queries; got != 2 {
 		t.Errorf("dns.queries after second write = %d, want 2", got)
+	}
+	wantEffective = []string{"223.5.5.5", "1.1.1.1"}
+	if len(second.DNSUpstreamEffective) != len(wantEffective) {
+		t.Fatalf("effective upstream after second write = %v, want %v", second.DNSUpstreamEffective, wantEffective)
+	}
+	for i := range wantEffective {
+		if second.DNSUpstreamEffective[i] != wantEffective[i] {
+			t.Errorf("effective upstream[%d] after second write = %q, want %q",
+				i, second.DNSUpstreamEffective[i], wantEffective[i])
+		}
 	}
 }
 
@@ -183,6 +209,9 @@ func TestWriterPublishesEmptyMetaArrays(t *testing.T) {
 	}
 	if got := string(raw["dns_upstream"]); got != "[]" {
 		t.Errorf("dns_upstream = %s, want []", got)
+	}
+	if got := string(raw["dns_upstream_effective"]); got != "[]" {
+		t.Errorf("dns_upstream_effective = %s, want []", got)
 	}
 	if got := string(raw["version"]); got != `"dev"` {
 		t.Errorf("version = %s, want \"dev\"", got)

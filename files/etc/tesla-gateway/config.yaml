@@ -17,7 +17,13 @@ stats_path: "/var/run/tesla-gateway/stats.json"
 dns:
   listen: "0.0.0.0:53"
   resolvers: [hosts, lease, system]
-  upstream: ["223.5.5.5", "119.29.29.29"]
+  # Ordered upstream priority list. Each item is an IPv4/IPv6 address or the
+  # keyword "dhcp" (alias "auto"). "dhcp" expands in place to the DNS servers
+  # assigned to the current default-route upstream interface (for example
+  # stawan/modem) via `ubus call network.interface dump`, cached for ~10s.
+  # If ubus is unavailable or no interface has dns-server, it is skipped.
+  # The list is tried from top to bottom; failure/timeout moves to the next.
+  upstream: ["dhcp", "223.5.5.5", "119.29.29.29"]
   hosts_path: "/etc/hosts"
   lease_path: "/tmp/dhcp.leases"
   clamp_ttl: 300

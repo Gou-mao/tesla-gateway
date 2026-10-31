@@ -87,7 +87,7 @@ go test -race -count=1 ./...
 | `mappings[].from` / `to` | 真实网段 → Tesla 所见映射网段，前缀长度必须相等 |
 | `dns.listen` | 模式 B 下为 `0.0.0.0:53` |
 | `dns.resolvers` | 依次尝试 `hosts`、`lease`、`system` |
-| `dns.upstream` | 上游 DNS，失败自动切换 |
+| `dns.upstream` | 有序上游优先级列表：IPv4/IPv6 地址或 `dhcp`（别名 `auto`），失败自动切换 |
 | `dns.clamp_ttl` / `cache_max` | TTL 上限、缓存条数上限 |
 | `proxy.tcp_listen` | 透明代理监听，默认 `:16464` |
 | `proxy.apply_nft` | `true` 时启动后自动下发 nft，退出时清理；默认 `false`，本地开发不碰防火墙 |
@@ -96,6 +96,27 @@ go test -race -count=1 ./...
 
 `proxy.apply_nft: true` 时，`tcp_listen` 必须是可解析的 `host:port`（端口为数字），
 且不能为空。`local_client_prefix` 解析失败或映射段全部被本地段覆盖时，进程启动失败并退出。
+
+### 上游 DNS 顺序与 `dhcp` 动态源
+
+`dns.upstream` 是**有序优先级列表**，顺序即尝试顺序：当前一项超时、拒绝或返回
+SERVFAIL/REFUSED 时自动切到下一项。列表至少要有 1 个有效项，每项只能是 IPv4/IPv6
+地址或关键字 `dhcp`（别名 `auto`）；主机名、带端口的地址或其它关键字会在加载配置时
+直接报错。纯 IP 列表的既有行为不变。
+
+`dhcp` 项会在**原位置**展开为当前上游接口通过 DHCP 拿到的 DNS 数组，例如：
+
+```yaml
+dns:
+  upstream: ["dhcp", "223.5.5.5", "119.29.29.29"]
+```
+
+在 OpenWrt 上，网关执行 `ubus call network.interface dump`，从 `interface[]` 中选择
+`up=true` 且带 `dns-server` 的接口；优先使用有默认路由（`target=0.0.0.0/0`，例如
+`stawan`/`modem`）的接口，没有默认路由时回退到第一个可用接口。展开结果按原数组顺序
+插入该位置，并缓存约 10 秒，避免每次查询都启动 `ubus`。如果拿不到地址（非 OpenWrt
+开发机没有 `ubus`、接口未启用、没有 `dns-server`），该项会被跳过并继续尝试后面的
+上游。实际选中的上游 IP 及其来源（`custom` / `dhcp`）会写入结构化日志。
 
 ## 部署
 
@@ -277,15 +298,17 @@ ssh root@192.168.1.1 '
 `/cgi-bin/luci/admin/services/tesla-gateway`）。页面按「状态 → 转发映射 →
 DHCP 下发 → DNS → 统计 → 设置」排列：转发映射直接回答「什么网段变成什么
 网段」，DHCP 区块由 LuCI 的 `dhcp` / `network` UCI 配置算出网关、地址池、
-租期以及实际下发的 option 3 / option 6，DNS 区块展示监听地址、上游和映射
-策略。服务状态、`stats.json` 统计和 nft 表状态每 4 秒刷新；页面提供启动 /
+租期以及实际下发的 option 3 / option 6，DNS 区块同时展示配置的 `dns.upstream`
+（可能包含 `dhcp` 关键字）和当前实际生效的 IP 列表 `dns_upstream_effective`。
+服务状态、`stats.json` 统计和 nft 表状态每 4 秒刷新；页面提供启动 /
 停止 / 重启按钮，以及 `/etc/tesla-gateway/config.yaml` 文本编辑和「保存并
 重启」。
 
 `stats.json` 同时包含静态配置语义和动态统计：`mappings`（`from` / `to`
-CIDR 原样字符串）、`mapping_strategy`、`dns_listen`、`dns_upstream`，以及
-`dns` / `proxy` 计数器。静态字段每次写文件时与最新动态快照合并，供 LuCI
-一次读取。
+CIDR 原样字符串）、`mapping_strategy`、`dns_listen`、`dns_upstream`
+（配置原样，含 `dhcp` 关键字）、`dns_upstream_effective`（当前实际解析出的
+IP 列表，DHCP 源随缓存刷新），以及 `dns` / `proxy` 计数器。静态字段每次写
+文件时与最新动态快照合并，供 LuCI 一次读取。
 
 ACL 说明：
 

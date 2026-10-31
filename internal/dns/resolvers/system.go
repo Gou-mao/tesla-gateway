@@ -2,27 +2,66 @@ package resolvers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	mdns "github.com/miekg/dns"
 
 	tgdns "tesla-gateway/internal/dns"
+	"tesla-gateway/internal/logx"
 )
 
-const defaultUpstreamTimeout = 5 * time.Second
+const (
+	defaultUpstreamTimeout = 5 * time.Second
+	defaultDHCPCacheTTL    = 10 * time.Second
+	ubusDumpTimeout        = 3 * time.Second
 
-// SystemResolver forwards questions to a list of upstream DNS servers. UDP is
-// tried first; a truncated response is retried over TCP. If an upstream fails,
-// the next one is tried.
+	upstreamSourceCustom = "custom"
+	upstreamSourceDHCP   = "dhcp"
+)
+
+// ubusDump runs the OpenWrt ubus query used to discover DHCP-provided DNS
+// servers. It is a variable so tests can replace it with a fixture.
+var ubusDump = runUbusDump
+
+// upstreamEntry is one configured or dynamically expanded upstream server.
+// DHCP entries are expanded to zero or more IP entries when queried.
+type upstreamEntry struct {
+	address string
+	display string
+	source  string
+}
+
+// SystemResolver forwards questions to an ordered list of upstream DNS
+// servers. UDP is tried first; a truncated response is retried over TCP. If an
+// upstream fails, the next one is tried. The "dhcp" (alias "auto") keyword is
+// expanded in place to the DNS servers currently assigned to the upstream
+// interface, as reported by ubus.
 type SystemResolver struct {
-	upstream []string
+	upstream []upstreamEntry
 	timeout  time.Duration
+
+	ubusDump func() ([]byte, error)
+	now      func() time.Time
+	dhcpTTL  time.Duration
+	logger   *logx.Logger
+
+	dhcpMu        sync.Mutex
+	dhcpServers   []string
+	dhcpInterface string
+	dhcpCachedAt  time.Time
+	dhcpCached    bool
+
+	logMu  sync.Mutex
+	logged map[string]struct{}
 }
 
 // SystemOption configures a SystemResolver.
@@ -37,24 +76,78 @@ func WithSystemTimeout(timeout time.Duration) SystemOption {
 	}
 }
 
-// NewSystemResolver creates a forwarding resolver. Upstreams may be bare IP
-// addresses (port 53 is assumed), hostnames, or host:port pairs.
+// WithSystemUbusDump injects the ubus dump command. It is primarily useful in
+// tests, where a fixture can stand in for an OpenWrt system.
+func WithSystemUbusDump(dump func() ([]byte, error)) SystemOption {
+	return func(r *SystemResolver) {
+		if dump != nil {
+			r.ubusDump = dump
+		}
+	}
+}
+
+// WithSystemDHCPCacheTTL overrides how long a DHCP DNS lookup is cached.
+func WithSystemDHCPCacheTTL(ttl time.Duration) SystemOption {
+	return func(r *SystemResolver) {
+		if ttl > 0 {
+			r.dhcpTTL = ttl
+		}
+	}
+}
+
+// WithSystemClock injects the clock used by the DHCP cache.
+func WithSystemClock(now func() time.Time) SystemOption {
+	return func(r *SystemResolver) {
+		if now != nil {
+			r.now = now
+		}
+	}
+}
+
+// WithSystemLogger sets the logger used to record DHCP expansion and the
+// upstream actually selected for a query.
+func WithSystemLogger(logger *logx.Logger) SystemOption {
+	return func(r *SystemResolver) {
+		if logger != nil {
+			r.logger = logger
+		}
+	}
+}
+
+// NewSystemResolver creates a forwarding resolver. Upstreams are kept in the
+// configured order. Each item may be a bare IP address (port 53 is assumed),
+// a host:port pair, or the keyword "dhcp" (alias "auto"). The keyword expands
+// to the DHCP-provided DNS servers of the current upstream interface.
 func NewSystemResolver(upstream []string, opts ...SystemOption) (*SystemResolver, error) {
-	normalized := make([]string, 0, len(upstream))
+	entries := make([]upstreamEntry, 0, len(upstream))
 	for i, raw := range upstream {
-		addr, err := normalizeUpstream(raw)
+		value := strings.TrimSpace(raw)
+		if isDHCPUpstream(value) {
+			entries = append(entries, upstreamEntry{source: upstreamSourceDHCP})
+			continue
+		}
+
+		addr, err := normalizeUpstream(value)
 		if err != nil {
 			return nil, fmt.Errorf("dns: upstream[%d] %q: %w", i, raw, err)
 		}
-		normalized = append(normalized, addr)
+		entries = append(entries, upstreamEntry{
+			address: addr,
+			display: displayUpstream(addr),
+			source:  upstreamSourceCustom,
+		})
 	}
-	if len(normalized) == 0 {
+	if len(entries) == 0 {
 		return nil, errors.New("dns: system resolver requires at least one upstream")
 	}
 
 	r := &SystemResolver{
-		upstream: normalized,
+		upstream: entries,
 		timeout:  defaultUpstreamTimeout,
+		ubusDump: ubusDump,
+		now:      time.Now,
+		dhcpTTL:  defaultDHCPCacheTTL,
+		logged:   make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -64,15 +157,151 @@ func NewSystemResolver(upstream []string, opts ...SystemOption) (*SystemResolver
 	return r, nil
 }
 
+func isDHCPUpstream(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "dhcp", "auto":
+		return true
+	default:
+		return false
+	}
+}
+
 // Name implements tgdns.Resolver.
 func (r *SystemResolver) Name() string { return "system" }
 
-// Upstreams returns the normalized upstream addresses.
+// Upstreams returns the normalized configured upstream addresses. DHCP
+// keywords are returned as the literal "dhcp" placeholder; use
+// EffectiveUpstreams to see the current expansion.
 func (r *SystemResolver) Upstreams() []string {
 	if r == nil {
 		return nil
 	}
-	return append([]string(nil), r.upstream...)
+	upstream := make([]string, 0, len(r.upstream))
+	for _, entry := range r.upstream {
+		if entry.source == upstreamSourceDHCP {
+			upstream = append(upstream, upstreamSourceDHCP)
+			continue
+		}
+		upstream = append(upstream, entry.address)
+	}
+	return upstream
+}
+
+// EffectiveUpstreams returns the ordered IP list currently used for queries,
+// with every "dhcp" entry expanded in place. It returns an empty slice when
+// only DHCP entries are configured and none can be resolved (for example on a
+// development machine without ubus).
+func (r *SystemResolver) EffectiveUpstreams() []string {
+	if r == nil {
+		return nil
+	}
+	entries := r.effectiveUpstreams()
+	effective := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		effective = append(effective, entry.display)
+	}
+	return effective
+}
+
+func (r *SystemResolver) effectiveUpstreams() []upstreamEntry {
+	entries := make([]upstreamEntry, 0, len(r.upstream))
+	now := r.now()
+	for _, entry := range r.upstream {
+		if entry.source != upstreamSourceDHCP {
+			entries = append(entries, entry)
+			continue
+		}
+
+		for _, server := range r.dhcpDNSServers(now) {
+			addr, err := normalizeUpstream(server)
+			if err != nil {
+				continue
+			}
+			entries = append(entries, upstreamEntry{
+				address: addr,
+				display: displayUpstream(addr),
+				source:  upstreamSourceDHCP,
+			})
+		}
+	}
+	return entries
+}
+
+// dhcpDNSServers returns the cached DHCP DNS list, refreshing it at most once
+// per dhcpTTL. Errors and empty results are cached too, so a non-OpenWrt host
+// does not run ubus on every DNS query.
+func (r *SystemResolver) dhcpDNSServers(now time.Time) []string {
+	r.dhcpMu.Lock()
+	defer r.dhcpMu.Unlock()
+
+	if r.dhcpCached && now.Sub(r.dhcpCachedAt) < r.dhcpTTL {
+		return append([]string(nil), r.dhcpServers...)
+	}
+
+	servers, iface := r.fetchDHCPDNS()
+	r.dhcpCached = true
+	r.dhcpCachedAt = now
+	r.dhcpServers = append([]string(nil), servers...)
+	r.dhcpInterface = iface
+
+	switch {
+	case len(servers) > 0:
+		r.logger.Info("dns dhcp upstream resolved", logx.Fields{
+			"interface": iface,
+			"servers":   servers,
+			"cache_ttl": r.dhcpTTL.String(),
+		})
+	default:
+		r.logger.Debug("dns dhcp upstream unavailable; skipping dhcp entry", logx.Fields{
+			"interface": iface,
+		})
+	}
+	return append([]string(nil), r.dhcpServers...)
+}
+
+func (r *SystemResolver) fetchDHCPDNS() ([]string, string) {
+	if r.ubusDump == nil {
+		return nil, ""
+	}
+	data, err := r.ubusDump()
+	if err != nil {
+		r.logger.Debug("dns dhcp lookup failed; skipping dhcp entry", logx.Fields{
+			"error": err.Error(),
+		})
+		return nil, ""
+	}
+	servers, iface, err := parseUbusDNSServers(data)
+	if err != nil {
+		r.logger.Debug("dns dhcp dump parse failed; skipping dhcp entry", logx.Fields{
+			"error": err.Error(),
+		})
+		return nil, ""
+	}
+	return servers, iface
+}
+
+func (r *SystemResolver) logSelected(entry upstreamEntry) {
+	if r.logger == nil {
+		return
+	}
+	key := entry.source + "|" + entry.display
+
+	r.logMu.Lock()
+	_, seen := r.logged[key]
+	if !seen {
+		r.logged[key] = struct{}{}
+	}
+	r.logMu.Unlock()
+
+	fields := logx.Fields{
+		"upstream": entry.display,
+		"source":   entry.source,
+	}
+	if seen {
+		r.logger.Debug("dns upstream selected", fields)
+		return
+	}
+	r.logger.Info("dns upstream selected", fields)
 }
 
 // Lookup implements tgdns.Resolver. Any valid upstream response is considered
@@ -105,22 +334,30 @@ func (r *SystemResolver) ExchangeMessage(ctx context.Context, req *mdns.Msg) (*m
 		return nil, errors.New("dns: upstream query has no question")
 	}
 
+	upstreams := r.effectiveUpstreams()
+	if len(upstreams) == 0 {
+		return nil, errors.New("dns: no upstream resolvers configured")
+	}
+
 	var errs []error
-	for _, upstream := range r.upstream {
+	for _, upstream := range upstreams {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		resp, err := r.exchange(ctx, req, upstream, "udp")
+		resp, err := r.exchange(ctx, req, upstream.address, "udp")
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s udp: %w", upstream, err))
+			errs = append(errs, fmt.Errorf("%s (%s) udp: %w", upstream.display, upstream.source, err))
 			continue
 		}
 
 		if resp.Truncated {
-			tcpResp, tcpErr := r.exchange(ctx, req, upstream, "tcp")
+			tcpResp, tcpErr := r.exchange(ctx, req, upstream.address, "tcp")
 			if tcpErr != nil {
-				errs = append(errs, fmt.Errorf("%s tcp after truncation: %w", upstream, tcpErr))
+				errs = append(errs, fmt.Errorf(
+					"%s (%s) tcp after truncation: %w",
+					upstream.display, upstream.source, tcpErr,
+				))
 				continue
 			}
 			resp = tcpResp
@@ -128,9 +365,13 @@ func (r *SystemResolver) ExchangeMessage(ctx context.Context, req *mdns.Msg) (*m
 
 		switch resp.Rcode {
 		case mdns.RcodeServerFailure, mdns.RcodeRefused:
-			errs = append(errs, fmt.Errorf("%s: response %s", upstream, mdns.RcodeToString[resp.Rcode]))
+			errs = append(errs, fmt.Errorf(
+				"%s (%s): response %s",
+				upstream.display, upstream.source, mdns.RcodeToString[resp.Rcode],
+			))
 			continue
 		}
+		r.logSelected(upstream)
 		return resp, nil
 	}
 
@@ -161,6 +402,260 @@ func (r *SystemResolver) exchange(ctx context.Context, req *mdns.Msg, upstream, 
 	return resp, nil
 }
 
+// runUbusDump queries OpenWrt for the current network interface state. On a
+// non-OpenWrt system (or when ubus is not installed) it returns an error and
+// the resolver simply skips the DHCP entry.
+func runUbusDump() ([]byte, error) {
+	path, err := exec.LookPath("ubus")
+	if err != nil {
+		return nil, fmt.Errorf("ubus is not available: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ubusDumpTimeout)
+	defer cancel()
+
+	data, err := exec.CommandContext(ctx, path, "call", "network.interface", "dump").Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("ubus call timed out: %w", ctx.Err())
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if detail := strings.TrimSpace(string(exitErr.Stderr)); detail != "" {
+				return nil, fmt.Errorf("ubus call failed: %s", detail)
+			}
+		}
+		return nil, fmt.Errorf("ubus call failed: %w", err)
+	}
+	return data, nil
+}
+
+type ubusDumpDocument struct {
+	Interfaces ubusInterfaceList `json:"interface"`
+}
+
+type ubusInterface struct {
+	Interface    ubusScalar     `json:"interface"`
+	Up           ubusBool       `json:"up"`
+	DNSServers   ubusStringList `json:"dns-server"`
+	Route        ubusRouteList  `json:"route"`
+	DefaultRoute ubusStringList `json:"default_route"`
+}
+
+// ubusRoute keeps only the fields needed for default-route detection plus
+// mask. OpenWrt emits route mask as a numeric prefix length on current
+// releases, while older dumps used a string. Other route fields (table,
+// metric, mtu, source, ...) are intentionally not declared: encoding/json
+// ignores unknown fields, so their varying types cannot break the parse.
+type ubusRoute struct {
+	Target  ubusScalar `json:"target"`
+	Netmask ubusScalar `json:"netmask"`
+	Mask    ubusScalar `json:"mask"`
+}
+
+// ubusScalar decodes any JSON scalar into its textual form. OpenWrt field types
+// are not stable across releases and protocols (for example route mask/table
+// are numbers while netmask/source are strings), so a single unexpected type
+// must not fail the whole dump. Non-scalar values decode to the empty string.
+type ubusScalar string
+
+func (s *ubusScalar) UnmarshalJSON(data []byte) error {
+	*s = ubusScalar(ubusScalarText(data))
+	return nil
+}
+
+func (s ubusScalar) String() string { return string(s) }
+
+func ubusScalarText(data []byte) string {
+	value := strings.TrimSpace(string(data))
+	if value == "" || value == "null" {
+		return ""
+	}
+
+	if value[0] == '"' {
+		var text string
+		if err := json.Unmarshal([]byte(value), &text); err == nil {
+			return text
+		}
+		return ""
+	}
+	if value == "true" || value == "false" {
+		return value
+	}
+
+	var number json.Number
+	if err := json.Unmarshal([]byte(value), &number); err == nil {
+		return number.String()
+	}
+	return ""
+}
+
+// ubusBool accepts booleans as well as the numeric and string spellings some
+// OpenWrt versions use for "up".
+type ubusBool bool
+
+func (b *ubusBool) UnmarshalJSON(data []byte) error {
+	switch strings.ToLower(ubusScalarText(data)) {
+	case "true", "1", "yes", "on", "up":
+		*b = true
+	default:
+		*b = false
+	}
+	return nil
+}
+
+// ubusStringList accepts a JSON string, number, or an array of such values.
+// OpenWrt normally emits arrays of strings for dns-server, but accepting
+// scalars and skipping unusable elements keeps older or hand-written fixtures
+// working. It never returns a type error: dns-server is advisory data.
+type ubusStringList []string
+
+func (l *ubusStringList) UnmarshalJSON(data []byte) error {
+	*l = nil
+
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err == nil {
+		for _, item := range items {
+			if value := ubusScalarText(item); value != "" {
+				*l = append(*l, value)
+			}
+		}
+		return nil
+	}
+
+	if value := ubusScalarText(data); value != "" {
+		*l = []string{value}
+	}
+	return nil
+}
+
+// ubusRouteList tolerates route entries with an unexpected shape by skipping
+// them instead of failing the entire interface dump.
+type ubusRouteList []ubusRoute
+
+func (l *ubusRouteList) UnmarshalJSON(data []byte) error {
+	*l = nil
+
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil
+	}
+	for _, item := range items {
+		var route ubusRoute
+		if err := json.Unmarshal(item, &route); err != nil {
+			continue
+		}
+		*l = append(*l, route)
+	}
+	return nil
+}
+
+// ubusInterfaceList tolerates interface entries with an unexpected shape by
+// skipping them instead of failing the entire dump.
+type ubusInterfaceList []ubusInterface
+
+func (l *ubusInterfaceList) UnmarshalJSON(data []byte) error {
+	*l = nil
+
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil
+	}
+	for _, item := range items {
+		var iface ubusInterface
+		if err := json.Unmarshal(item, &iface); err != nil {
+			continue
+		}
+		*l = append(*l, iface)
+	}
+	return nil
+}
+
+// parseUbusDNSServers extracts the DHCP-provided DNS servers from an OpenWrt
+// `ubus call network.interface dump` response. Interfaces with a default route
+// win; otherwise the first up interface with usable dns-server values is used.
+// The returned interface name is informational and may be empty.
+func parseUbusDNSServers(data []byte) ([]string, string, error) {
+	var document ubusDumpDocument
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, "", fmt.Errorf("parse ubus network.interface dump: %w", err)
+	}
+
+	var fallbackServers []string
+	var fallbackInterface string
+
+	for i := range document.Interfaces {
+		iface := &document.Interfaces[i]
+		if !iface.Up {
+			continue
+		}
+
+		servers := normalizeDNSServers(iface.DNSServers)
+		if len(servers) == 0 {
+			continue
+		}
+
+		if hasDefaultRoute(*iface) {
+			return servers, iface.Interface.String(), nil
+		}
+		if fallbackServers == nil {
+			fallbackServers = servers
+			fallbackInterface = iface.Interface.String()
+		}
+	}
+
+	if fallbackServers != nil {
+		return fallbackServers, fallbackInterface, nil
+	}
+	return nil, "", nil
+}
+
+func normalizeDNSServers(values []string) []string {
+	servers := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			continue
+		}
+		servers = append(servers, addr.String())
+	}
+	return servers
+}
+
+func hasDefaultRoute(iface ubusInterface) bool {
+	for _, route := range iface.DefaultRoute {
+		switch strings.TrimSpace(route) {
+		case "0.0.0.0/0", "::/0":
+			return true
+		}
+	}
+
+	for _, route := range iface.Route {
+		// Use the textual target/netmask pair only. route.mask is a numeric
+		// prefix length in real OpenWrt dumps and must not drive this check.
+		target := strings.TrimSpace(route.Target.String())
+		netmask := strings.TrimSpace(route.Netmask.String())
+
+		switch target {
+		case "0.0.0.0/0", "::/0", "default":
+			return true
+		case "0.0.0.0":
+			if netmask == "0.0.0.0" {
+				return true
+			}
+		case "::":
+			if netmask == "::" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func normalizeUpstream(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -185,6 +680,17 @@ func normalizeUpstream(raw string) (string, error) {
 		return "", fmt.Errorf("invalid upstream address %q", raw)
 	}
 	return net.JoinHostPort(s, "53"), nil
+}
+
+func displayUpstream(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if port == "53" {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func validatePort(port string) error {
