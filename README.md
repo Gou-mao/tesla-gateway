@@ -1,5 +1,9 @@
 # Tesla Gateway
 
+[![ci](https://github.com/Gou-mao/tesla-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Gou-mao/tesla-gateway/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![go](https://img.shields.io/badge/go-1.22%2B-00ADD8.svg)](https://go.dev)
+
 运行在 OpenWrt（aarch64，本文以 UFI003 4G 模块为例）上的纯 Go「智能 DNS + L3/L4 透明网关」。Tesla 只看到
 `100.64.x.x` 这样的映射地址，网关按配置的 `from → to` 前缀把连接还原到真实内网
 （`192.168.x`、`10.x`、其它 `100.6x` 等）。新增内网设备只需增加一条映射，无需为每个
