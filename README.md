@@ -41,6 +41,9 @@ tesla-gateway/
 │   └── logx/                      # 结构化 JSON 日志
 ├── files/etc/init.d/tesla-gateway # procd 服务脚本
 ├── files/etc/tesla-gateway/config.yaml # UFI003 样例配置
+├── files/usr/share/luci/menu.d/luci-app-tesla-gateway.json   # LuCI 菜单
+├── files/usr/share/rpcd/acl.d/luci-app-tesla-gateway.json    # LuCI ACL
+├── files/www/luci-static/resources/view/tesla-gateway/overview.js # LuCI 页面
 ├── configs/config.example.yaml    # 开发机样例配置
 ├── scripts/deploy.sh              # 示例 scp 部署脚本（不硬编码密码）
 ├── docs/DESIGN.md                 # 设计文档
@@ -233,6 +236,73 @@ logread -f | grep tesla-gateway
 如果 `dig` 返回真实 `192.168.x.x`，说明请求没有经过 `tg-dns`（dnsmasq 仍占用 53 或客户端
 未使用网关 DNS）；如果 TCP 能连但 80/443 无响应，检查 nft 是否下发、`ip_forward` 和
 `proxy.tcp_listen` 端口。
+
+## LuCI 界面
+
+LuCI 插件是三个静态文件，不需要 opkg，也不修改 Go 程序：
+
+| 仓库文件 | 设备路径 |
+|---|---|
+| `files/usr/share/luci/menu.d/luci-app-tesla-gateway.json` | `/usr/share/luci/menu.d/` |
+| `files/usr/share/rpcd/acl.d/luci-app-tesla-gateway.json` | `/usr/share/rpcd/acl.d/` |
+| `files/www/luci-static/resources/view/tesla-gateway/overview.js` | `/www/luci-static/resources/view/tesla-gateway/` |
+
+安装（在仓库根目录执行，host 换成设备地址）：
+
+```sh
+ssh root@192.168.1.1 'mkdir -p /www/luci-static/resources/view/tesla-gateway'
+
+scp -O files/usr/share/luci/menu.d/luci-app-tesla-gateway.json \
+  root@192.168.1.1:/usr/share/luci/menu.d/
+scp -O files/usr/share/rpcd/acl.d/luci-app-tesla-gateway.json \
+  root@192.168.1.1:/usr/share/rpcd/acl.d/
+scp -O files/www/luci-static/resources/view/tesla-gateway/overview.js \
+  root@192.168.1.1:/www/luci-static/resources/view/tesla-gateway/
+
+ssh root@192.168.1.1 '
+  chmod 0644 \
+    /usr/share/luci/menu.d/luci-app-tesla-gateway.json \
+    /usr/share/rpcd/acl.d/luci-app-tesla-gateway.json \
+    /www/luci-static/resources/view/tesla-gateway/overview.js
+  rm -f /tmp/luci-indexcache*
+  /etc/init.d/rpcd restart
+'
+```
+
+浏览器打开 **LuCI → 服务 → Tesla Gateway**（即
+`/cgi-bin/luci/admin/services/tesla-gateway`）。页面每 4 秒刷新一次服务状态、
+`stats.json` 统计和 nft 表状态；提供启动 / 停止 / 重启按钮，以及
+`/etc/tesla-gateway/config.yaml` 文本编辑和「保存并重启」。
+
+ACL 说明：
+
+- `menu.d` 的 `depends.acl` 要求当前登录用户拥有 `luci-app-tesla-gateway`
+  ACL 组；root 默认可读写全部 ACL，普通委派账号需要在
+  `/etc/config/rpcd` 的 login 段授予该组。
+- `fs.read` / `fs.write` 由 rpcd 的 `file` 对象按 ACL 里的**真实文件路径**检查。
+  `fs.exec` 不是给 `ubus.file` 授权，而是给要执行的**可执行文件路径**加
+  `"exec"`，例如：
+  `"/etc/init.d/tesla-gateway": [ "exec" ]`、`"/usr/sbin/nft": [ "exec" ]`。
+  本项目的 read 段放行 init.d / nft 的 exec，write 段再次放行 init.d exec，
+  以覆盖「查看状态」和「启动 / 停止 / 重启」两类调用。
+- OpenWrt 的 `/var` 通常指向 `/tmp`，较新的 rpcd 会先 `realpath()` 再复检
+  ACL 目标路径。因此 ACL 同时列出 `/var/run/tesla-gateway/stats.json`、
+  `/tmp/run/tesla-gateway/stats.json` 和 `/tmp/tesla-gateway/stats.json`；
+  设备上只会命中实际存在的那一个，多列不影响安全。
+- 只读 ACL 用户也拥有 init.d 的 `exec` 后，就能执行该脚本的
+  start/stop/restart（`exec` 权限无法按参数细分）。如果要做严格的只读委派，
+  应把 init.d 的 `exec` 只保留在 write 段；此时页面仍可读统计，但运行状态会
+  显示为「未知」。
+- 修改 menu 或 ACL 后必须清缓存并重启 rpcd；只改 view 通常刷新浏览器即可。
+
+若页面菜单不出现或按钮报权限错误，检查：
+
+```sh
+logread -f | grep rpcd
+ls -l /usr/share/luci/menu.d/luci-app-tesla-gateway.json \
+      /usr/share/rpcd/acl.d/luci-app-tesla-gateway.json \
+      /www/luci-static/resources/view/tesla-gateway/overview.js
+```
 
 ## 回滚
 
