@@ -227,6 +227,32 @@ func (r *SystemResolver) effectiveUpstreams() []upstreamEntry {
 	return entries
 }
 
+// DHCPStatus returns the DHCP DNS servers currently used to expand the "dhcp"
+// upstream placeholder and the interface they were learned from. It shares the
+// regular DHCP cache, so the lookup runs at most once per dhcpTTL regardless of
+// how often callers (for example the stats writer) read the status.
+func (r *SystemResolver) DHCPStatus() ([]string, string) {
+	if r == nil || !r.hasDHCPUpstream() {
+		return nil, ""
+	}
+
+	now := r.now()
+	r.dhcpMu.Lock()
+	defer r.dhcpMu.Unlock()
+
+	r.refreshDHCPDNSLocked(now)
+	return append([]string(nil), r.dhcpServers...), r.dhcpInterface
+}
+
+func (r *SystemResolver) hasDHCPUpstream() bool {
+	for _, entry := range r.upstream {
+		if entry.source == upstreamSourceDHCP {
+			return true
+		}
+	}
+	return false
+}
+
 // dhcpDNSServers returns the cached DHCP DNS list, refreshing it at most once
 // per dhcpTTL. Errors and empty results are cached too, so a non-OpenWrt host
 // does not run ubus on every DNS query.
@@ -234,8 +260,15 @@ func (r *SystemResolver) dhcpDNSServers(now time.Time) []string {
 	r.dhcpMu.Lock()
 	defer r.dhcpMu.Unlock()
 
+	r.refreshDHCPDNSLocked(now)
+	return append([]string(nil), r.dhcpServers...)
+}
+
+// refreshDHCPDNSLocked refreshes the cache when it is expired. The caller must
+// hold dhcpMu.
+func (r *SystemResolver) refreshDHCPDNSLocked(now time.Time) {
 	if r.dhcpCached && now.Sub(r.dhcpCachedAt) < r.dhcpTTL {
-		return append([]string(nil), r.dhcpServers...)
+		return
 	}
 
 	servers, iface := r.fetchDHCPDNS()
@@ -256,7 +289,6 @@ func (r *SystemResolver) dhcpDNSServers(now time.Time) []string {
 			"interface": iface,
 		})
 	}
-	return append([]string(nil), r.dhcpServers...)
 }
 
 func (r *SystemResolver) fetchDHCPDNS() ([]string, string) {

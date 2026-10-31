@@ -546,6 +546,8 @@ return view.extend({
 		var upstreamPending = null;
 		var root = null;
 		var refreshing = false;
+		var dhcpUpstreamServers = [];
+		var dhcpUpstreamInterface = '';
 
 		refs.badge = E('span', { 'class': 'label' }, [ _('读取中…') ]);
 		refs.version = E('span', {}, [ _('—') ]);
@@ -700,6 +702,37 @@ return view.extend({
 			return true;
 		}
 
+		function syncDHCPUpstreamFromStats(currentStats) {
+			var servers = currentStats && Array.isArray(currentStats.dns_dhcp_servers)
+				? currentStats.dns_dhcp_servers.map(function(item) {
+					return String(item);
+				}).filter(function(item) {
+					return item !== '';
+				})
+				: [];
+			var iface = currentStats && currentStats.dns_dhcp_interface != null
+				? String(currentStats.dns_dhcp_interface)
+				: '';
+			var changed = iface !== dhcpUpstreamInterface ||
+				!sameUpstreamList(servers, dhcpUpstreamServers);
+
+			dhcpUpstreamServers = servers;
+			dhcpUpstreamInterface = iface;
+
+			return changed;
+		}
+
+		function dhcpSuffixText() {
+			if (!dhcpUpstreamServers.length)
+				return _('未解析到地址');
+
+			var servers = dhcpUpstreamServers.join(', ');
+
+			return dhcpUpstreamInterface
+				? servers + _('，来自 ') + dhcpUpstreamInterface
+				: servers;
+		}
+
 		function renderUpstreamEditor() {
 			while (refs.dnsUpstreamList.firstChild)
 				refs.dnsUpstreamList.removeChild(refs.dnsUpstreamList.firstChild);
@@ -754,9 +787,16 @@ return view.extend({
 					E('span', {
 						'style': 'min-width: 2em; color: #666;'
 					}, [ String(index + 1) + '.' ]),
-					E('code', {
+					E('span', {
 						'style': 'flex: 1; word-break: break-all;'
-					}, [ value ]),
+					}, [
+						E('code', {}, [ value ]),
+						upstreamKey(value) === 'dhcp'
+							? E('span', {
+								'style': 'margin-left: .35em; color: #888; font-size: 90%;'
+							}, [ _('（') + dhcpSuffixText() + _('）') ])
+							: ''
+					]),
 					upBtn,
 					downBtn,
 					deleteBtn
@@ -962,6 +1002,7 @@ return view.extend({
 			var dns = currentStats && currentStats.dns ? currentStats.dns : {};
 			var proxy = currentStats && currentStats.proxy ? currentStats.proxy : {};
 			var listeners = currentStats && currentStats.listeners ? currentStats.listeners : {};
+			var dhcpChanged = syncDHCPUpstreamFromStats(currentStats);
 
 			actionState.running = state.running;
 
@@ -1000,6 +1041,8 @@ return view.extend({
 				: _('—');
 			if (currentStats && Array.isArray(currentStats.dns_upstream))
 				syncUpstreamFromStats(upstream);
+			if (dhcpChanged && upstreamInitialized)
+				renderUpstreamEditor();
 			refs.dnsUpstreamEffective.textContent = currentStats
 				? (upstreamEffective.length
 					? upstreamEffective.join(', ')
@@ -1117,20 +1160,12 @@ return view.extend({
 			}
 		});
 
-		function stopPolling() {
-			window.setTimeout(function() {
-				poll.remove(refresh);
-			}, 0);
-		}
-
 		function refresh() {
 			if (refreshing)
 				return Promise.resolve();
 
-			if (!root || !document.body.contains(root)) {
-				stopPolling();
+			if (!root || !document.body.contains(root))
 				return Promise.resolve();
-			}
 
 			refreshing = true;
 
@@ -1141,8 +1176,6 @@ return view.extend({
 			]).then(function(result) {
 				if (root && document.body.contains(root))
 					applyLive(result[0], result[1], result[2]);
-				else
-					stopPolling();
 			}).catch(function() {
 				/* Keep the last known values when a poll fails. */
 			}).then(function() {
@@ -1265,6 +1298,7 @@ return view.extend({
 		applyLive(stats, status, nft);
 
 		poll.add(refresh, 4);
+		poll.start();
 
 		return root;
 	}

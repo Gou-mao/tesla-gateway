@@ -279,6 +279,13 @@ func run() int {
 			}
 			return runtime.system.EffectiveUpstreams()
 		},
+		DHCPUpstream: func() ([]string, string) {
+			runtime := dnsRuntimeState.Load()
+			if runtime == nil || runtime.system == nil {
+				return nil, ""
+			}
+			return runtime.system.DHCPStatus()
+		},
 	}, runtimeStats, logger.WithModule("stats"))
 	if err != nil {
 		// Stats publication is best-effort; it must never prevent the gateway

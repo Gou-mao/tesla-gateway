@@ -43,6 +43,8 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 
 	started := time.Now().UTC().Add(-90 * time.Second).Truncate(time.Second)
 	effectiveUpstream := []string{"223.5.5.5", "8.8.8.8"}
+	dhcpServers := []string{"192.168.1.1"}
+	dhcpInterface := "stawan"
 	writer, err := stats.NewWriter(stats.WriterConfig{
 		Path:      path,
 		PID:       4242,
@@ -62,6 +64,9 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 			DNSUpstream:     []string{"223.5.5.5", "dhcp"},
 		},
 		EffectiveUpstream: func() []string { return effectiveUpstream },
+		DHCPUpstream: func() ([]string, string) {
+			return dhcpServers, dhcpInterface
+		},
 	}, st, nil)
 	if err != nil {
 		t.Fatalf("NewWriter() = %v", err)
@@ -135,6 +140,19 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 			)
 		}
 	}
+	wantDHCPServers := []string{"192.168.1.1"}
+	if len(document.DNSDHCPServers) != len(wantDHCPServers) {
+		t.Fatalf("dns_dhcp_servers = %v, want %v", document.DNSDHCPServers, wantDHCPServers)
+	}
+	for i := range wantDHCPServers {
+		if document.DNSDHCPServers[i] != wantDHCPServers[i] {
+			t.Errorf("dns_dhcp_servers[%d] = %q, want %q",
+				i, document.DNSDHCPServers[i], wantDHCPServers[i])
+		}
+	}
+	if got := document.DNSDHCPInterface; got != "stawan" {
+		t.Errorf("dns_dhcp_interface = %q, want stawan", got)
+	}
 	if got := document.DNS.Queries; got != 1 {
 		t.Errorf("dns.queries = %d, want 1", got)
 	}
@@ -166,6 +184,8 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 	// The file is replaced atomically on every write.
 	st.IncDNSQueries()
 	effectiveUpstream = []string{"223.5.5.5", "1.1.1.1"}
+	dhcpServers = []string{"192.168.1.1", "192.168.1.2"}
+	dhcpInterface = "wan"
 	if err := writer.Write(); err != nil {
 		t.Fatalf("second Write() = %v", err)
 	}
@@ -183,11 +203,29 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 				i, second.DNSUpstreamEffective[i], wantEffective[i])
 		}
 	}
+	wantDHCPServers = []string{"192.168.1.1", "192.168.1.2"}
+	if len(second.DNSDHCPServers) != len(wantDHCPServers) {
+		t.Fatalf("dns_dhcp_servers after second write = %v, want %v", second.DNSDHCPServers, wantDHCPServers)
+	}
+	for i := range wantDHCPServers {
+		if second.DNSDHCPServers[i] != wantDHCPServers[i] {
+			t.Errorf("dns_dhcp_servers[%d] after second write = %q, want %q",
+				i, second.DNSDHCPServers[i], wantDHCPServers[i])
+		}
+	}
+	if got := second.DNSDHCPInterface; got != "wan" {
+		t.Errorf("dns_dhcp_interface after second write = %q, want wan", got)
+	}
 }
 
 func TestWriterPublishesEmptyMetaArrays(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats.json")
-	writer, err := stats.NewWriter(stats.WriterConfig{Path: path}, stats.New(), nil)
+	writer, err := stats.NewWriter(stats.WriterConfig{
+		Path: path,
+		// No DHCP source could be resolved; the fields must still be present as
+		// an empty array and an empty string.
+		DHCPUpstream: func() ([]string, string) { return nil, "" },
+	}, stats.New(), nil)
 	if err != nil {
 		t.Fatalf("NewWriter() = %v", err)
 	}
@@ -212,6 +250,12 @@ func TestWriterPublishesEmptyMetaArrays(t *testing.T) {
 	}
 	if got := string(raw["dns_upstream_effective"]); got != "[]" {
 		t.Errorf("dns_upstream_effective = %s, want []", got)
+	}
+	if got := string(raw["dns_dhcp_servers"]); got != "[]" {
+		t.Errorf("dns_dhcp_servers = %s, want []", got)
+	}
+	if got := string(raw["dns_dhcp_interface"]); got != `""` {
+		t.Errorf("dns_dhcp_interface = %s, want \"\"", got)
 	}
 	if got := string(raw["version"]); got != `"dev"` {
 		t.Errorf("version = %s, want \"dev\"", got)

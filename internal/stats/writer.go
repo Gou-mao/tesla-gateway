@@ -68,6 +68,11 @@ type WriterConfig struct {
 	// reflected without a restart. When nil, Meta.DNSUpstreamEffective is
 	// published as-is.
 	EffectiveUpstream func() []string
+	// DHCPUpstream optionally reports the resolver's cached DHCP DNS servers
+	// and the source interface. It is called on every write, so implementations
+	// must reuse an existing DHCP cache instead of querying ubus each time.
+	// When nil, empty values are published.
+	DHCPUpstream func() (servers []string, iface string)
 }
 
 // FileSnapshot is the top-level JSON document written by Writer. The static
@@ -83,6 +88,8 @@ type FileSnapshot struct {
 	DNSListen            string        `json:"dns_listen"`
 	DNSUpstream          []string      `json:"dns_upstream"`
 	DNSUpstreamEffective []string      `json:"dns_upstream_effective"`
+	DNSDHCPServers       []string      `json:"dns_dhcp_servers"`
+	DNSDHCPInterface     string        `json:"dns_dhcp_interface"`
 	DNS                  DNSSnapshot   `json:"dns"`
 	Proxy                ProxySnapshot `json:"proxy"`
 }
@@ -196,6 +203,14 @@ func (w *Writer) Write() error {
 	}
 	effectiveUpstream = append([]string{}, effectiveUpstream...)
 
+	dhcpServers := []string{}
+	dhcpInterface := ""
+	if w.cfg.DHCPUpstream != nil {
+		servers, iface := w.cfg.DHCPUpstream()
+		dhcpServers = append(dhcpServers, servers...)
+		dhcpInterface = strings.TrimSpace(iface)
+	}
+
 	document := FileSnapshot{
 		Version:              w.cfg.Meta.Version,
 		PID:                  w.cfg.PID,
@@ -207,6 +222,8 @@ func (w *Writer) Write() error {
 		DNSListen:            w.cfg.Meta.DNSListen,
 		DNSUpstream:          append([]string{}, w.cfg.Meta.DNSUpstream...),
 		DNSUpstreamEffective: effectiveUpstream,
+		DNSDHCPServers:       dhcpServers,
+		DNSDHCPInterface:     dhcpInterface,
 		DNS:                  snapshot.DNS,
 		Proxy:                snapshot.Proxy,
 	}

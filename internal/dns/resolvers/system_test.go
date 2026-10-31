@@ -181,6 +181,76 @@ func TestSystemResolverDHCPExpansionOrderAndCache(t *testing.T) {
 	}
 }
 
+func TestSystemResolverDHCPStatusUsesCache(t *testing.T) {
+	var calls atomic.Int32
+	const dump = `{
+		"interface": [
+			{
+				"interface": "stawan",
+				"up": true,
+				"route": [{"target": "0.0.0.0", "netmask": "0.0.0.0"}],
+				"dns-server": ["192.168.1.1"]
+			}
+		]
+	}`
+
+	resolver, err := resolvers.NewSystemResolver(
+		[]string{"dhcp", "223.5.5.5"},
+		resolvers.WithSystemUbusDump(func() ([]byte, error) {
+			calls.Add(1)
+			return []byte(dump), nil
+		}),
+		resolvers.WithSystemDHCPCacheTTL(time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("NewSystemResolver() = %v", err)
+	}
+
+	servers, iface := resolver.DHCPStatus()
+	wantServers := []string{"192.168.1.1"}
+	if !reflect.DeepEqual(servers, wantServers) {
+		t.Errorf("DHCPStatus() servers = %v, want %v", servers, wantServers)
+	}
+	if iface != "stawan" {
+		t.Errorf("DHCPStatus() interface = %q, want stawan", iface)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("ubus calls = %d, want 1", got)
+	}
+
+	// The status shares the resolver's DHCP cache, so repeated stats writes do
+	// not run ubus again.
+	_, _ = resolver.DHCPStatus()
+	if got := resolver.EffectiveUpstreams(); !reflect.DeepEqual(got, []string{"192.168.1.1", "223.5.5.5"}) {
+		t.Errorf("EffectiveUpstreams() = %v, want [192.168.1.1 223.5.5.5]", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("ubus calls after cache hits = %d, want 1", got)
+	}
+}
+
+func TestSystemResolverDHCPStatusWithoutDHCPEntry(t *testing.T) {
+	var calls atomic.Int32
+	resolver, err := resolvers.NewSystemResolver(
+		[]string{"223.5.5.5"},
+		resolvers.WithSystemUbusDump(func() ([]byte, error) {
+			calls.Add(1)
+			return nil, errors.New("ubus should not be called")
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSystemResolver() = %v", err)
+	}
+
+	servers, iface := resolver.DHCPStatus()
+	if len(servers) != 0 || iface != "" {
+		t.Errorf("DHCPStatus() = %v, %q; want empty values", servers, iface)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("ubus calls = %d, want 0 without a dhcp upstream", got)
+	}
+}
+
 func TestSystemResolverDHCPUnavailableIsSkipped(t *testing.T) {
 	var calls atomic.Int32
 	resolver, err := resolvers.NewSystemResolver(

@@ -307,6 +307,8 @@ DHCP 下发 → DNS → 统计 → 设置」排列：转发映射直接回答「
 网段」，DHCP 区块由 LuCI 的 `dhcp` / `network` UCI 配置算出网关、地址池、
 租期以及实际下发的 option 3 / option 6，DNS 区块同时展示可编辑的配置 `dns.upstream`
 （可能包含 `dhcp` 关键字）和只读的当前实际生效 IP 列表 `dns_upstream_effective`。
+列表中的 `dhcp` / `auto` 项后会用灰色小字显示当前解析到的地址与来源接口
+（例如 `（192.168.1.1，来自 stawan）`；没有解析结果时显示 `（未解析到地址）`）。
 服务状态、`stats.json` 统计和 nft 表状态每 4 秒刷新；页面提供启动 /
 停止 / 重启按钮，以及 `/etc/tesla-gateway/config.yaml` 文本编辑和「保存并
 重启」。
@@ -314,7 +316,9 @@ DHCP 下发 → DNS → 统计 → 设置」排列：转发映射直接回答「
 `stats.json` 同时包含静态配置语义和动态统计：`mappings`（`from` / `to`
 CIDR 原样字符串）、`mapping_strategy`、`dns_listen`、`dns_upstream`
 （配置原样，含 `dhcp` 关键字）、`dns_upstream_effective`（当前实际解析出的
-IP 列表，DHCP 源随缓存刷新），以及 `dns` / `proxy` 计数器。静态字段每次写
+IP 列表，DHCP 源随缓存刷新）、`dns_dhcp_servers` / `dns_dhcp_interface`
+（DHCP 源解析到的 DNS 地址数组和来源接口名，无结果时分别为 `[]` / `""`），
+以及 `dns` / `proxy` 计数器。静态字段每次写
 文件时与最新动态快照合并，供 LuCI 一次读取。
 
 ACL 说明：
