@@ -48,9 +48,12 @@ tesla-gateway/
 ├── files/usr/share/luci/menu.d/luci-app-tesla-gateway.json   # LuCI 菜单
 ├── files/usr/share/rpcd/acl.d/luci-app-tesla-gateway.json    # LuCI ACL
 ├── files/www/luci-static/resources/view/tesla-gateway/overview.js # LuCI 页面
+├── files/usr/libexec/ts-addr-sync.sh   # Tailscale 共存：动态补 tun 地址 + 100.64/10 路由
+├── scripts/install-tailscale-coexist.sh # Tailscale 共存设备部署脚本
 ├── configs/config.example.yaml    # 开发机样例配置
 ├── scripts/deploy.sh              # 示例 scp 部署脚本（不硬编码密码）
 ├── docs/DESIGN.md                 # 设计文档
+├── docs/TAILSCALE-COEXIST.md      # 保留 100.64 LAN 同时跑 Tailscale 的完整方案
 └── Makefile
 ```
 
@@ -354,6 +357,17 @@ ls -l /usr/share/luci/menu.d/luci-app-tesla-gateway.json \
       /usr/share/rpcd/acl.d/luci-app-tesla-gateway.json \
       /www/luci-static/resources/view/tesla-gateway/overview.js
 ```
+
+## Tailscale 共存（可选）
+
+本项目 LAN 必须是 `100.64.0.0/24`（Tesla 限制），而 Tailscale 默认把整个
+`100.64.0.0/10` 当作自己的地址池，其 anti-spoof 规则会误伤 LAN（含 DNS 到
+`100.64.0.1:53`）。若需在同一台设备上同时跑 Tailscale，按
+[docs/TAILSCALE-COEXIST.md](docs/TAILSCALE-COEXIST.md) 操作：`netfilter-mode=off`
+去掉 anti-spoof，再用 `files/usr/libexec/ts-addr-sync.sh`（cron 每分钟幂等）动态
+补回 off 模式不再自动配置的 tun 地址与 `100.64.0.0/10` 路由（节点 IP 变自动跟、
+peer 增删零维护），并把 `tailscale0` 放入 wan 区（masq + lan→wan forward）。
+一键部署：`scripts/install-tailscale-coexist.sh`。
 
 ## 回滚
 
