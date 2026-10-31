@@ -30,34 +30,54 @@ type Listeners struct {
 	Proxy string `json:"proxy"`
 }
 
+// Mapping is one real-to-Tesla-visible prefix pair. Both values are the CIDR
+// strings from the configuration, kept verbatim so the UI can explain the
+// forwarding relationship without reimplementing prefix parsing.
+type Mapping struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// Meta is the static configuration metadata published alongside the runtime
+// counters. It contains no secrets and changes only when the process restarts
+// with a different configuration.
+type Meta struct {
+	Version         string    `json:"version"`
+	Listeners       Listeners `json:"listeners"`
+	Mappings        []Mapping `json:"mappings"`
+	MappingStrategy string    `json:"mapping_strategy"`
+	DNSListen       string    `json:"dns_listen"`
+	DNSUpstream     []string  `json:"dns_upstream"`
+}
+
 // WriterConfig configures a stats file Writer.
 type WriterConfig struct {
 	// Path is the destination JSON file. Empty uses DefaultPath.
 	Path string
 	// Interval is the periodic publication interval. Zero uses 2s.
 	Interval time.Duration
-	// Version is the program version string. Empty uses "dev".
-	Version string
 	// PID is the process id reported in the file. Zero uses os.Getpid().
 	PID int
 	// StartedAt is the process start time. Zero uses Stats.StartedAt().
 	StartedAt time.Time
-	// Listeners contains the bound DNS and proxy addresses.
-	Listeners Listeners
-	// MappedPrefixes is the list of advertised mapped prefixes.
-	MappedPrefixes []string
+	// Meta is the static configuration metadata merged into every snapshot.
+	Meta Meta
 }
 
-// FileSnapshot is the top-level JSON document written by Writer.
+// FileSnapshot is the top-level JSON document written by Writer. The static
+// meta fields and the dynamic DNS/proxy counters are merged into one object.
 type FileSnapshot struct {
-	Version        string        `json:"version"`
-	PID            int           `json:"pid"`
-	StartedAt      string        `json:"started_at"`
-	UptimeSec      int64         `json:"uptime_sec"`
-	Listeners      Listeners     `json:"listeners"`
-	MappedPrefixes []string      `json:"mapped_prefixes"`
-	DNS            DNSSnapshot   `json:"dns"`
-	Proxy          ProxySnapshot `json:"proxy"`
+	Version         string        `json:"version"`
+	PID             int           `json:"pid"`
+	StartedAt       string        `json:"started_at"`
+	UptimeSec       int64         `json:"uptime_sec"`
+	Listeners       Listeners     `json:"listeners"`
+	Mappings        []Mapping     `json:"mappings"`
+	MappingStrategy string        `json:"mapping_strategy"`
+	DNSListen       string        `json:"dns_listen"`
+	DNSUpstream     []string      `json:"dns_upstream"`
+	DNS             DNSSnapshot   `json:"dns"`
+	Proxy           ProxySnapshot `json:"proxy"`
 }
 
 // Writer periodically publishes Stats as a JSON file. Writes are serialized and
@@ -86,11 +106,7 @@ func NewWriter(cfg WriterConfig, st *Stats, logger *logx.Logger) (*Writer, error
 	if cfg.Interval <= 0 {
 		cfg.Interval = DefaultInterval
 	}
-	if strings.TrimSpace(cfg.Version) == "" {
-		cfg.Version = DefaultVersion
-	} else {
-		cfg.Version = strings.TrimSpace(cfg.Version)
-	}
+	cfg.Meta = normalizeMeta(cfg.Meta)
 	if cfg.PID <= 0 {
 		cfg.PID = os.Getpid()
 	}
@@ -100,13 +116,33 @@ func NewWriter(cfg WriterConfig, st *Stats, logger *logx.Logger) (*Writer, error
 			cfg.StartedAt = time.Now()
 		}
 	}
-	cfg.MappedPrefixes = append([]string(nil), cfg.MappedPrefixes...)
 
 	return &Writer{
 		cfg:    cfg,
 		stats:  st,
 		logger: logger,
 	}, nil
+}
+
+func normalizeMeta(meta Meta) Meta {
+	meta.Version = strings.TrimSpace(meta.Version)
+	if meta.Version == "" {
+		meta.Version = DefaultVersion
+	}
+	meta.MappingStrategy = strings.TrimSpace(meta.MappingStrategy)
+	meta.DNSListen = strings.TrimSpace(meta.DNSListen)
+
+	// Always publish arrays rather than null so LuCI can iterate them without
+	// a separate presence check.
+	mappings := make([]Mapping, 0, len(meta.Mappings))
+	mappings = append(mappings, meta.Mappings...)
+	meta.Mappings = mappings
+
+	upstream := make([]string, 0, len(meta.DNSUpstream))
+	upstream = append(upstream, meta.DNSUpstream...)
+	meta.DNSUpstream = upstream
+
+	return meta
 }
 
 // Path returns the configured destination path.
@@ -144,14 +180,17 @@ func (w *Writer) Write() error {
 	}
 
 	document := FileSnapshot{
-		Version:        w.cfg.Version,
-		PID:            w.cfg.PID,
-		StartedAt:      w.cfg.StartedAt.UTC().Format(time.RFC3339),
-		UptimeSec:      uptime,
-		Listeners:      w.cfg.Listeners,
-		MappedPrefixes: append([]string{}, w.cfg.MappedPrefixes...),
-		DNS:            snapshot.DNS,
-		Proxy:          snapshot.Proxy,
+		Version:         w.cfg.Meta.Version,
+		PID:             w.cfg.PID,
+		StartedAt:       w.cfg.StartedAt.UTC().Format(time.RFC3339),
+		UptimeSec:       uptime,
+		Listeners:       w.cfg.Meta.Listeners,
+		Mappings:        append([]Mapping{}, w.cfg.Meta.Mappings...),
+		MappingStrategy: w.cfg.Meta.MappingStrategy,
+		DNSListen:       w.cfg.Meta.DNSListen,
+		DNSUpstream:     append([]string{}, w.cfg.Meta.DNSUpstream...),
+		DNS:             snapshot.DNS,
+		Proxy:           snapshot.Proxy,
 	}
 
 	data, err := json.Marshal(document)

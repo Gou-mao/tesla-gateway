@@ -2,6 +2,7 @@
 	"luci-app-tesla-gateway": {
 		"description": "Grant access to Tesla Gateway status, control and configuration",
 		"read": {
+			"uci": [ "dhcp", "network" ],
 			"file": {
 				"/var/run/tesla-gateway/stats.json": [ "read" ],
 				"/tmp/run/tesla-gateway/stats.json": [ "read" ],

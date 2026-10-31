@@ -4,6 +4,7 @@
 'require fs';
 'require ui';
 'require poll';
+'require uci';
 
 var INIT = '/etc/init.d/tesla-gateway';
 var CONFIG = '/etc/tesla-gateway/config.yaml';
@@ -22,6 +23,269 @@ function readStats() {
 			return null;
 		}
 	});
+}
+
+function loadUCI() {
+	return Promise.all([
+		uci.load('dhcp').then(function() { return true; }).catch(function() { return false; }),
+		uci.load('network').then(function() { return true; }).catch(function() { return false; })
+	]).then(function(loaded) {
+		return { dhcp: loaded[0], network: loaded[1] };
+	});
+}
+
+function uciGet(config, section, option) {
+	try {
+		return uci.get(config, section, option);
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+function firstValue(value) {
+	if (Array.isArray(value))
+		return value.length ? value[0] : null;
+	return value;
+}
+
+function asList(value) {
+	if (value == null || value === '')
+		return [];
+
+	if (Array.isArray(value))
+		return value.map(function(item) { return String(item); });
+
+	return String(value).split(/\s+/).filter(function(item) { return item !== ''; });
+}
+
+function uniqueValues(values) {
+	var result = [];
+
+	values.forEach(function(value) {
+		if (result.indexOf(value) < 0)
+			result.push(value);
+	});
+
+	return result;
+}
+
+function getDhcpOptionValues(options, number) {
+	var wanted = String(number);
+	var values = [];
+
+	asList(options).forEach(function(entry) {
+		asList(entry).forEach(function(part) {
+			var text = part.trim();
+			var comma = text.indexOf(',');
+			var colon = text.indexOf(':');
+			var sep = comma >= 0 ? comma : colon;
+
+			if (sep < 0 || text.slice(0, sep).trim() !== wanted)
+				return;
+
+			text.slice(sep + 1).split(',').forEach(function(value) {
+				value = value.trim();
+				if (value)
+					values.push(value);
+			});
+		});
+	});
+
+	return uniqueValues(values);
+}
+
+function parseIPv4(value) {
+	if (value == null)
+		return null;
+
+	var parts = String(value).trim().split('.');
+
+	if (parts.length !== 4)
+		return null;
+
+	var octets = [];
+
+	for (var i = 0; i < parts.length; i++) {
+		if (!/^\d{1,3}$/.test(parts[i]))
+			return null;
+
+		var octet = Number(parts[i]);
+
+		if (octet < 0 || octet > 255)
+			return null;
+
+		octets.push(octet);
+	}
+
+	return octets;
+}
+
+function parseCIDR(value) {
+	var parts = String(value == null ? '' : value).trim().split('/');
+
+	if (parts.length > 2)
+		return null;
+
+	var octets = parseIPv4(parts[0]);
+
+	if (!octets)
+		return null;
+
+	var bits = null;
+
+	if (parts.length === 2) {
+		if (!/^\d{1,2}$/.test(parts[1]))
+			return null;
+
+		bits = Number(parts[1]);
+
+		if (bits < 0 || bits > 32)
+			return null;
+	}
+
+	return { octets: octets, bits: bits };
+}
+
+function netmaskToBits(value) {
+	var octets = parseIPv4(value);
+
+	if (!octets)
+		return null;
+
+	var bits = 0;
+	var zeroSeen = false;
+
+	for (var i = 0; i < octets.length; i++) {
+		for (var bit = 7; bit >= 0; bit--) {
+			var one = ((octets[i] >> bit) & 1) === 1;
+
+			if (one) {
+				if (zeroSeen)
+					return null;
+				bits++;
+			}
+			else {
+				zeroSeen = true;
+			}
+		}
+	}
+
+	return bits;
+}
+
+function ipv4ToInt(octets) {
+	return octets[0] * 16777216 + octets[1] * 65536 + octets[2] * 256 + octets[3];
+}
+
+function intToIPv4(value) {
+	value = Math.floor(value);
+
+	return [
+		Math.floor(value / 16777216) % 256,
+		Math.floor(value / 65536) % 256,
+		Math.floor(value / 256) % 256,
+		value % 256
+	].join('.');
+}
+
+function positiveInt(value, fallback) {
+	var number = Number(value);
+
+	if (!isFinite(number) || number <= 0)
+		return fallback;
+
+	return Math.floor(number);
+}
+
+function formatLease(value) {
+	if (value == null || value === '')
+		return _('—');
+
+	var text = String(value).trim();
+
+	return text === '0' ? _('永久') : text;
+}
+
+function computeDHCPInfo() {
+	var ipValue = firstValue(uciGet('network', 'lan', 'ipaddr'));
+	var netmaskValue = firstValue(uciGet('network', 'lan', 'netmask'));
+	var parsed = parseCIDR(ipValue);
+	var bits = parsed && parsed.bits != null ? parsed.bits : netmaskToBits(netmaskValue);
+	var gateway = parsed ? intToIPv4(ipv4ToInt(parsed.octets)) : '';
+	var start = positiveInt(uciGet('dhcp', 'lan', 'start'), 100);
+	var limit = positiveInt(uciGet('dhcp', 'lan', 'limit'), 150);
+	var pool = _('—');
+
+	if (bits == null)
+		bits = 24;
+
+	if (parsed) {
+		var ip = ipv4ToInt(parsed.octets);
+		var block = Math.pow(2, 32 - bits);
+		var network = Math.floor(ip / block) * block;
+		var broadcast = network + block - 1;
+		var first = network + start;
+		var last = first + limit - 1;
+		var lastUsable = bits >= 31 ? broadcast : broadcast - 1;
+
+		if (first >= network && first <= lastUsable) {
+			if (last > lastUsable)
+				last = lastUsable;
+
+			pool = intToIPv4(first) + ' – ' + intToIPv4(last);
+		}
+	}
+
+	var options = uciGet('dhcp', 'lan', 'dhcp_option');
+	var dnsValues = getDhcpOptionValues(options, 6);
+	var routerValues = getDhcpOptionValues(options, 3);
+
+	return {
+		gateway: gateway || _('—'),
+		pool: pool,
+		lease: formatLease(uciGet('dhcp', 'lan', 'leasetime')),
+		dns: dnsValues.length
+			? dnsValues.join(', ')
+			: (gateway ? _('本机 ') + gateway + _('（默认）') : _('本机（默认）')),
+		router: routerValues.length
+			? routerValues.join(', ')
+			: (gateway || _('—'))
+	};
+}
+
+function cidrWildcard(octets, bits) {
+	if (bits % 8 !== 0)
+		return null;
+
+	var fixed = bits / 8;
+	var parts = [];
+
+	for (var i = 0; i < fixed; i++)
+		parts.push(String(octets[i]));
+
+	for (var j = fixed; j < 4; j++)
+		parts.push('X');
+
+	return parts.join('.');
+}
+
+function explainMapping(from, to) {
+	var source = parseCIDR(from);
+	var target = parseCIDR(to);
+
+	if (source && target && source.bits != null && target.bits != null &&
+	    source.bits === target.bits) {
+		var sourceText = cidrWildcard(source.octets, source.bits);
+		var targetText = cidrWildcard(target.octets, target.bits);
+
+		if (sourceText && targetText &&
+		    (sourceText.indexOf('X') >= 0 || targetText.indexOf('X') >= 0))
+			return sourceText + _(' 在 Tesla 上访问时显示为 ') + targetText;
+	}
+
+	return String(from) + _(' 内的地址在 Tesla 上显示为 ') +
+		String(to) + _(' 内的对应地址');
 }
 
 function formatNumber(value) {
@@ -81,6 +345,16 @@ function formatUptime(value) {
 	parts.push(seconds + 's');
 
 	return parts.join(' ');
+}
+
+function formatStrategy(value) {
+	if (value == null || value === '')
+		return _('—');
+
+	if (value === 'prefix')
+		return _('prefix（前缀替换）');
+
+	return String(value);
 }
 
 function getServiceState(result) {
@@ -153,7 +427,8 @@ return view.extend({
 			readStats(),
 			L.resolveDefault(fs.exec(INIT, [ 'status' ]), null),
 			L.resolveDefault(fs.read(CONFIG), null),
-			L.resolveDefault(fs.exec(NFT, [ 'list', 'table', 'ip', 'teslagateway' ]), null)
+			L.resolveDefault(fs.exec(NFT, [ 'list', 'table', 'ip', 'teslagateway' ]), null),
+			loadUCI()
 		]);
 	},
 
@@ -162,6 +437,7 @@ return view.extend({
 		var status = data[1];
 		var config = data[2];
 		var nft = data[3];
+		var uciState = data[4];
 		var refs = {};
 		var actionState = { busy: false, running: null };
 		var root = null;
@@ -171,20 +447,30 @@ return view.extend({
 		refs.version = E('span', {}, [ _('—') ]);
 		refs.pid = E('span', {}, [ _('—') ]);
 		refs.uptime = E('span', {}, [ _('—') ]);
-		refs.dns = E('span', {}, [ _('—') ]);
 		refs.proxy = E('span', {}, [ _('—') ]);
 		refs.nft = E('span', { 'class': 'label' }, [ _('—') ]);
 		refs.updated = E('span', {}, [ _('—') ]);
+		refs.mappings = E('tbody', {});
+		refs.dhcpWarning = E('p', {
+			'class': 'alert-message warning',
+			'style': 'display: none;'
+		}, [ _('未能读取 UCI 的 dhcp/network 配置，以下 DHCP 信息可能不完整。') ]);
+		refs.dhcpGateway = E('span', {}, [ _('—') ]);
+		refs.dhcpPool = E('span', {}, [ _('—') ]);
+		refs.dhcpLease = E('span', {}, [ _('—') ]);
+		refs.dhcpDNS = E('span', {}, [ _('—') ]);
+		refs.dhcpRouter = E('span', {}, [ _('—') ]);
+		refs.dnsListen = E('span', {}, [ _('—') ]);
+		refs.dnsUpstream = E('span', {}, [ _('—') ]);
+		refs.mappingStrategy = E('span', {}, [ _('—') ]);
 		refs.queries = E('span', {}, [ _('—') ]);
 		refs.hits = E('span', {}, [ _('—') ]);
 		refs.misses = E('span', {}, [ _('—') ]);
 		refs.entries = E('span', {}, [ _('—') ]);
-		refs.upstream = E('span', {}, [ _('—') ]);
 		refs.active = E('span', {}, [ _('—') ]);
 		refs.total = E('span', {}, [ _('—') ]);
 		refs.c2u = E('span', {}, [ _('—') ]);
 		refs.u2c = E('span', {}, [ _('—') ]);
-		refs.prefixes = E('code', {}, [ _('—') ]);
 
 		var textarea = E('textarea', {
 			'class': 'cbi-input-textarea',
@@ -218,6 +504,54 @@ return view.extend({
 			saveBtn.disabled = actionState.busy || config == null;
 		}
 
+		function renderMappings(mappings) {
+			while (refs.mappings.firstChild)
+				refs.mappings.removeChild(refs.mappings.firstChild);
+
+			if (mappings == null) {
+				refs.mappings.appendChild(E('tr', [
+					E('td', { 'class': 'td', 'colspan': '4' }, [
+						_('无法读取 stats.json，暂时无法显示映射。')
+					])
+				]));
+				return;
+			}
+
+			if (mappings.length === 0) {
+				refs.mappings.appendChild(E('tr', [
+					E('td', { 'class': 'td', 'colspan': '4' }, [
+						_('未配置映射。请在下方设置中填写 mappings。')
+					])
+				]));
+				return;
+			}
+
+			mappings.forEach(function(mapping) {
+				var from = mapping && mapping.from ? String(mapping.from) : '—';
+				var to = mapping && mapping.to ? String(mapping.to) : '—';
+
+				refs.mappings.appendChild(E('tr', [
+					E('td', { 'class': 'td' }, [ E('code', {}, [ from ]) ]),
+					E('td', { 'class': 'td', 'style': 'text-align: center;' }, [ '⇄' ]),
+					E('td', { 'class': 'td' }, [ E('code', {}, [ to ]) ]),
+					E('td', { 'class': 'td' }, [ explainMapping(from, to) ])
+				]));
+			});
+		}
+
+		function applyDHCP() {
+			var info = computeDHCPInfo();
+
+			refs.dhcpGateway.textContent = info.gateway;
+			refs.dhcpPool.textContent = info.pool;
+			refs.dhcpLease.textContent = info.lease;
+			refs.dhcpDNS.textContent = info.dns;
+			refs.dhcpRouter.textContent = info.router;
+
+			if (!uciState || !uciState.dhcp || !uciState.network)
+				refs.dhcpWarning.style.display = '';
+		}
+
 		function applyLive(currentStats, currentStatus, currentNft) {
 			var state = getServiceState(currentStatus);
 			var nftState = getNftState(currentNft);
@@ -238,9 +572,6 @@ return view.extend({
 				? String(currentStats.pid) : _('—');
 			refs.uptime.textContent = currentStats && currentStats.uptime_sec != null
 				? formatUptime(currentStats.uptime_sec) : _('—');
-
-			refs.dns.textContent = currentStats
-				? (listeners.dns || _('禁用')) : _('—');
 			refs.proxy.textContent = currentStats
 				? (listeners.proxy || _('禁用')) : _('—');
 
@@ -252,24 +583,30 @@ return view.extend({
 			else
 				refs.nft.removeAttribute('title');
 
+			renderMappings(currentStats && Array.isArray(currentStats.mappings)
+				? currentStats.mappings : (currentStats ? [] : null));
+
+			var upstream = currentStats && Array.isArray(currentStats.dns_upstream)
+				? currentStats.dns_upstream : [];
+
+			refs.dnsListen.textContent = currentStats
+				? (currentStats.dns_listen || listeners.dns || _('禁用'))
+				: _('—');
+			refs.dnsUpstream.textContent = upstream.length
+				? upstream.join(', ')
+				: (currentStats ? _('未配置') : _('—'));
+			refs.mappingStrategy.textContent = currentStats
+				? formatStrategy(currentStats.mapping_strategy)
+				: _('—');
+
 			refs.queries.textContent = formatNumber(dns.queries);
 			refs.hits.textContent = formatNumber(dns.cache_hits);
 			refs.misses.textContent = formatNumber(dns.cache_misses);
 			refs.entries.textContent = formatNumber(dns.cache_entries);
-			refs.upstream.textContent = formatNumber(dns.upstream_queries);
-
 			refs.active.textContent = formatNumber(proxy.active_conns);
 			refs.total.textContent = formatNumber(proxy.total_conns);
 			refs.c2u.textContent = formatBytes(proxy.bytes_client_to_upstream);
 			refs.u2c.textContent = formatBytes(proxy.bytes_upstream_to_client);
-
-			if (!currentStats || !Array.isArray(currentStats.mapped_prefixes))
-				refs.prefixes.textContent = _('—');
-			else if (currentStats.mapped_prefixes.length === 0)
-				refs.prefixes.textContent = _('无（未配置映射）');
-			else
-				refs.prefixes.textContent = currentStats.mapped_prefixes.join(', ');
-
 			refs.updated.textContent = _('最后更新：') + new Date().toLocaleTimeString();
 
 			syncButtons();
@@ -391,19 +728,55 @@ return view.extend({
 			tableRow(_('版本'), refs.version),
 			tableRow(_('PID'), refs.pid),
 			tableRow(_('运行时间'), refs.uptime),
-			tableRow(_('DNS 监听'), refs.dns),
 			tableRow(_('代理监听'), refs.proxy),
-			tableRow(_('nft 规则'), refs.nft)
+			tableRow(_('nft 转发规则'), refs.nft)
+		]);
+
+		var mappingTable = E('table', { 'class': 'table' }, [
+			E('thead', {}, [
+				E('tr', {}, [
+					E('th', { 'class': 'th' }, [ _('真实网段') ]),
+					E('th', { 'class': 'th', 'style': 'width: 2em; text-align: center;' }, [ '⇄' ]),
+					E('th', { 'class': 'th' }, [ _('Tesla 可见网段') ]),
+					E('th', { 'class': 'th' }, [ _('白话说明') ])
+				])
+			]),
+			refs.mappings
+		]);
+
+		var dhcpTable = table([
+			tableRow(_('网关（br-lan）'), refs.dhcpGateway),
+			tableRow(_('地址池'), refs.dhcpPool),
+			tableRow(_('租期'), refs.dhcpLease),
+			tableRow(_('下发的 DNS'), refs.dhcpDNS),
+			tableRow(_('下发网关'), refs.dhcpRouter)
+		]);
+
+		var dnsTable = table([
+			tableRow(_('监听地址'), refs.dnsListen),
+			tableRow(_('上游服务器'), refs.dnsUpstream),
+			tableRow(_('映射策略'), refs.mappingStrategy)
+		]);
+
+		var statsTable = table([
+			tableRow(_('DNS 查询总数'), refs.queries),
+			tableRow(_('缓存命中'), refs.hits),
+			tableRow(_('缓存未命中'), refs.misses),
+			tableRow(_('缓存条目'), refs.entries),
+			tableRow(_('活动连接'), refs.active),
+			tableRow(_('连接总数'), refs.total),
+			tableRow(_('客户端 → 上游'), refs.c2u),
+			tableRow(_('上游 → 客户端'), refs.u2c)
 		]);
 
 		root = E('div', {}, [
 			E('h2', {}, [ _('Tesla Gateway') ]),
+			E('p', { 'class': 'cbi-value-description' }, [
+				_('这里展示实际生效的转发关系，以及 DHCP / DNS 下发给客户端的内容；运行统计放在页面末尾。')
+			]),
 
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('服务状态') ]),
-				E('p', { 'class': 'cbi-value-description' }, [
-					_('通过 /etc/init.d/tesla-gateway 控制服务，状态每 4 秒自动刷新。')
-				]),
+				E('h3', {}, [ _('状态') ]),
 				E('div', {
 					'class': 'cbi-page-actions',
 					'style': 'margin: 1em 0;'
@@ -412,36 +785,37 @@ return view.extend({
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('DNS 统计') ]),
-				table([
-					tableRow(_('查询总数'), refs.queries),
-					tableRow(_('缓存命中'), refs.hits),
-					tableRow(_('缓存未命中'), refs.misses),
-					tableRow(_('缓存条目'), refs.entries),
-					tableRow(_('上游查询'), refs.upstream)
-				])
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('代理统计') ]),
-				table([
-					tableRow(_('活动连接'), refs.active),
-					tableRow(_('连接总数'), refs.total),
-					tableRow(_('客户端 → 上游'), refs.c2u),
-					tableRow(_('上游 → 客户端'), refs.u2c)
-				])
-			]),
-
-			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('映射前缀') ]),
+				E('h3', {}, [ _('转发映射 —— 什么变成什么') ]),
 				E('p', { 'class': 'cbi-value-description' }, [
-					_('来自 stats.json 的 mapped_prefixes（Tesla 所见网段）。')
+					_('左侧是家庭网络里的真实地址，右侧是 Tesla 看到的映射地址；中间一一对应转发。')
 				]),
-				E('div', {}, [ refs.prefixes ])
+				mappingTable
 			]),
 
 			E('div', { 'class': 'cbi-section' }, [
-				E('h3', {}, [ _('配置') ]),
+				E('h3', {}, [ _('DHCP 下发') ]),
+				E('p', { 'class': 'cbi-value-description' }, [
+					_('根据 LuCI 当前的 dhcp/network 配置计算，客户端续租后生效。')
+				]),
+				refs.dhcpWarning,
+				dhcpTable
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('DNS') ]),
+				dnsTable
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('统计') ]),
+				E('p', { 'class': 'cbi-value-description' }, [
+					refs.updated
+				]),
+				statsTable
+			]),
+
+			E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, [ _('设置') ]),
 				E('p', { 'class': 'cbi-value-description' }, [
 					_('编辑 /etc/tesla-gateway/config.yaml。保存后会自动重启服务。')
 				]),
@@ -458,6 +832,7 @@ return view.extend({
 			])
 		]);
 
+		applyDHCP();
 		applyLive(stats, status, nft);
 
 		poll.add(refresh, 4);

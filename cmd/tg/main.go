@@ -247,11 +247,6 @@ func run() int {
 	}
 
 	var statsWriterDone <-chan struct{}
-	mappedPrefixes := engine.MappedPrefixes()
-	reportedPrefixes := make([]string, 0, len(mappedPrefixes))
-	for _, prefix := range mappedPrefixes {
-		reportedPrefixes = append(reportedPrefixes, prefix.String())
-	}
 	listeners := stats.Listeners{}
 	if server != nil {
 		listeners.DNS = server.Addr()
@@ -261,10 +256,8 @@ func run() int {
 	}
 
 	statsWriter, err := stats.NewWriter(stats.WriterConfig{
-		Path:           cfg.StatsPath,
-		Version:        version,
-		Listeners:      listeners,
-		MappedPrefixes: reportedPrefixes,
+		Path: cfg.StatsPath,
+		Meta: statsMeta(cfg, version, listeners),
 	}, runtimeStats, logger.WithModule("stats"))
 	if err != nil {
 		// Stats publication is best-effort; it must never prevent the gateway
@@ -345,6 +338,28 @@ func run() int {
 	}
 	logger.Info("tesla-gateway stopped", nil)
 	return exitCode
+}
+
+func statsMeta(cfg *config.Config, version string, listeners stats.Listeners) stats.Meta {
+	mappings := make([]stats.Mapping, 0, len(cfg.Mappings))
+	for _, pair := range cfg.Mappings {
+		mappings = append(mappings, stats.Mapping{
+			From: pair.From,
+			To:   pair.To,
+		})
+	}
+
+	upstream := make([]string, 0, len(cfg.DNS.Upstream))
+	upstream = append(upstream, cfg.DNS.Upstream...)
+
+	return stats.Meta{
+		Version:         version,
+		Listeners:       listeners,
+		Mappings:        mappings,
+		MappingStrategy: cfg.MappingStrategy,
+		DNSListen:       cfg.DNS.Listen,
+		DNSUpstream:     upstream,
+	}
 }
 
 type dnsRuntime struct {

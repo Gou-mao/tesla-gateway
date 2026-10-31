@@ -44,14 +44,22 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 	started := time.Now().UTC().Add(-90 * time.Second).Truncate(time.Second)
 	writer, err := stats.NewWriter(stats.WriterConfig{
 		Path:      path,
-		Version:   "test-version",
 		PID:       4242,
 		StartedAt: started,
-		Listeners: stats.Listeners{
-			DNS:   "[::]:53",
-			Proxy: "[::]:16464",
+		Meta: stats.Meta{
+			Version: "test-version",
+			Listeners: stats.Listeners{
+				DNS:   "[::]:53",
+				Proxy: "[::]:16464",
+			},
+			Mappings: []stats.Mapping{
+				{From: "192.168.1.0/24", To: "100.64.1.0/24"},
+				{From: "10.243.0.0/16", To: "100.66.0.0/16"},
+			},
+			MappingStrategy: "prefix",
+			DNSListen:       "0.0.0.0:53",
+			DNSUpstream:     []string{"223.5.5.5", "119.29.29.29"},
 		},
-		MappedPrefixes: []string{"100.64.1.0/24"},
 	}, st, nil)
 	if err != nil {
 		t.Fatalf("NewWriter() = %v", err)
@@ -86,8 +94,32 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 	if document.Listeners.DNS != "[::]:53" || document.Listeners.Proxy != "[::]:16464" {
 		t.Errorf("listeners = %+v, want DNS [::]:53 and proxy [::]:16464", document.Listeners)
 	}
-	if len(document.MappedPrefixes) != 1 || document.MappedPrefixes[0] != "100.64.1.0/24" {
-		t.Errorf("mapped_prefixes = %v, want [100.64.1.0/24]", document.MappedPrefixes)
+	if document.MappingStrategy != "prefix" {
+		t.Errorf("mapping_strategy = %q, want prefix", document.MappingStrategy)
+	}
+	if document.DNSListen != "0.0.0.0:53" {
+		t.Errorf("dns_listen = %q, want 0.0.0.0:53", document.DNSListen)
+	}
+	wantMappings := []stats.Mapping{
+		{From: "192.168.1.0/24", To: "100.64.1.0/24"},
+		{From: "10.243.0.0/16", To: "100.66.0.0/16"},
+	}
+	if len(document.Mappings) != len(wantMappings) {
+		t.Fatalf("mappings = %v, want %v", document.Mappings, wantMappings)
+	}
+	for i := range wantMappings {
+		if document.Mappings[i] != wantMappings[i] {
+			t.Errorf("mappings[%d] = %+v, want %+v", i, document.Mappings[i], wantMappings[i])
+		}
+	}
+	wantUpstream := []string{"223.5.5.5", "119.29.29.29"}
+	if len(document.DNSUpstream) != len(wantUpstream) {
+		t.Fatalf("dns_upstream = %v, want %v", document.DNSUpstream, wantUpstream)
+	}
+	for i := range wantUpstream {
+		if document.DNSUpstream[i] != wantUpstream[i] {
+			t.Errorf("dns_upstream[%d] = %q, want %q", i, document.DNSUpstream[i], wantUpstream[i])
+		}
 	}
 	if got := document.DNS.Queries; got != 1 {
 		t.Errorf("dns.queries = %d, want 1", got)
@@ -127,13 +159,45 @@ func TestWriterWritesValidAtomicJSON(t *testing.T) {
 	}
 }
 
+func TestWriterPublishesEmptyMetaArrays(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.json")
+	writer, err := stats.NewWriter(stats.WriterConfig{Path: path}, stats.New(), nil)
+	if err != nil {
+		t.Fatalf("NewWriter() = %v", err)
+	}
+	if err := writer.Write(); err != nil {
+		t.Fatalf("Write() = %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read stats file: %v", err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal stats file: %v", err)
+	}
+	if got := string(raw["mappings"]); got != "[]" {
+		t.Errorf("mappings = %s, want []", got)
+	}
+	if got := string(raw["dns_upstream"]); got != "[]" {
+		t.Errorf("dns_upstream = %s, want []", got)
+	}
+	if got := string(raw["version"]); got != `"dev"` {
+		t.Errorf("version = %s, want \"dev\"", got)
+	}
+}
+
 func TestWriterRunWritesImmediatelyPeriodicallyAndOnCancel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats.json")
 	st := stats.New()
 	writer, err := stats.NewWriter(stats.WriterConfig{
 		Path:     path,
 		Interval: 20 * time.Millisecond,
-		Version:  "run-test",
+		Meta: stats.Meta{
+			Version: "run-test",
+		},
 	}, st, nil)
 	if err != nil {
 		t.Fatalf("NewWriter() = %v", err)

@@ -270,15 +270,26 @@ ssh root@192.168.1.1 '
 ```
 
 浏览器打开 **LuCI → 服务 → Tesla Gateway**（即
-`/cgi-bin/luci/admin/services/tesla-gateway`）。页面每 4 秒刷新一次服务状态、
-`stats.json` 统计和 nft 表状态；提供启动 / 停止 / 重启按钮，以及
-`/etc/tesla-gateway/config.yaml` 文本编辑和「保存并重启」。
+`/cgi-bin/luci/admin/services/tesla-gateway`）。页面按「状态 → 转发映射 →
+DHCP 下发 → DNS → 统计 → 设置」排列：转发映射直接回答「什么网段变成什么
+网段」，DHCP 区块由 LuCI 的 `dhcp` / `network` UCI 配置算出网关、地址池、
+租期以及实际下发的 option 3 / option 6，DNS 区块展示监听地址、上游和映射
+策略。服务状态、`stats.json` 统计和 nft 表状态每 4 秒刷新；页面提供启动 /
+停止 / 重启按钮，以及 `/etc/tesla-gateway/config.yaml` 文本编辑和「保存并
+重启」。
+
+`stats.json` 同时包含静态配置语义和动态统计：`mappings`（`from` / `to`
+CIDR 原样字符串）、`mapping_strategy`、`dns_listen`、`dns_upstream`，以及
+`dns` / `proxy` 计数器。静态字段每次写文件时与最新动态快照合并，供 LuCI
+一次读取。
 
 ACL 说明：
 
 - `menu.d` 的 `depends.acl` 要求当前登录用户拥有 `luci-app-tesla-gateway`
   ACL 组；root 默认可读写全部 ACL，普通委派账号需要在
   `/etc/config/rpcd` 的 login 段授予该组。
+- read 段的 `"uci": [ "dhcp", "network" ]` 用于页面读取 DHCP 地址池和
+  option 3 / 6；如果移除，DHCP 区块会显示权限不足或默认值。
 - `fs.read` / `fs.write` 由 rpcd 的 `file` 对象按 ACL 里的**真实文件路径**检查。
   `fs.exec` 不是给 `ubus.file` 授权，而是给要执行的**可执行文件路径**加
   `"exec"`，例如：
