@@ -144,6 +144,28 @@ func TestCacheKeyIsCaseInsensitiveAndQTypeSpecific(t *testing.T) {
 	}
 }
 
+func TestCacheSizeCountsOnlyValidEntries(t *testing.T) {
+	now := time.Unix(1000, 0)
+	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
+
+	cache.Put(cacheQuestion("short.home.", mdns.TypeA), positiveResponse("short.home.", 1))
+	cache.Put(cacheQuestion("long.home.", mdns.TypeA), positiveResponse("long.home.", 60))
+	if got := cache.Size(); got != 2 {
+		t.Errorf("Size() = %d, want 2", got)
+	}
+
+	now = now.Add(2 * time.Second)
+	if got := cache.Size(); got != 1 {
+		t.Errorf("Size() after expiry = %d, want 1", got)
+	}
+	if got := cache.Len(); got != 1 {
+		t.Errorf("Len() after Size cleanup = %d, want 1", got)
+	}
+	if _, ok := cache.Get(cacheQuestion("long.home.", mdns.TypeA)); !ok {
+		t.Error("valid entry was removed by Size")
+	}
+}
+
 func TestCacheClear(t *testing.T) {
 	now := time.Unix(1000, 0)
 	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))

@@ -17,6 +17,7 @@ mappings:
   - { from: "192.168.1.0/24", to: "100.64.1.0/24" }
 real_prefixes:
   - "192.168.0.0/16"
+stats_path: "/tmp/tesla-gateway-stats.json"
 dns:
   listen: "0.0.0.0:53"
   resolvers: [hosts, lease, system]
@@ -54,6 +55,9 @@ func TestLoad(t *testing.T) {
 	}
 	if len(cfg.Mappings) != 1 || cfg.Mappings[0].From != "192.168.1.0/24" {
 		t.Errorf("Mappings = %+v, want one 192.168.1.0/24 mapping", cfg.Mappings)
+	}
+	if cfg.StatsPath != "/tmp/tesla-gateway-stats.json" {
+		t.Errorf("StatsPath = %q, want /tmp/tesla-gateway-stats.json", cfg.StatsPath)
 	}
 	if cfg.DNS.Listen != "0.0.0.0:53" || cfg.DNS.ClampTTL != 300 || cfg.DNS.CacheMax != 4096 {
 		t.Errorf("DNS config = %+v", cfg.DNS)
@@ -100,6 +104,9 @@ func TestExampleConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(example config) = %v, want nil", err)
 	}
+	if cfg.StatsPath != config.DefaultStatsPath {
+		t.Errorf("StatsPath = %q, want %q", cfg.StatsPath, config.DefaultStatsPath)
+	}
 	if cfg.Strategy == nil {
 		t.Fatal("Strategy = nil, want compiled mapping strategy")
 	}
@@ -115,6 +122,9 @@ func TestOpenWrtSampleConfig(t *testing.T) {
 	}
 	if !cfg.Proxy.ApplyNft {
 		t.Error("Proxy.ApplyNft = false, want true")
+	}
+	if cfg.StatsPath != config.DefaultStatsPath {
+		t.Errorf("StatsPath = %q, want %q", cfg.StatsPath, config.DefaultStatsPath)
 	}
 	if cfg.Proxy.LocalClientPrefix != "100.64.0.0/24" {
 		t.Errorf("Proxy.LocalClientPrefix = %q, want 100.64.0.0/24", cfg.Proxy.LocalClientPrefix)
@@ -153,6 +163,9 @@ proxy:
 	}
 	if cfg.Proxy.ApplyNft {
 		t.Error("ApplyNft = true, want default false")
+	}
+	if cfg.StatsPath != config.DefaultStatsPath {
+		t.Errorf("StatsPath = %q, want default %q", cfg.StatsPath, config.DefaultStatsPath)
 	}
 	if cfg.Proxy.LocalClientPrefix != config.DefaultLocalClientPrefix {
 		t.Errorf(

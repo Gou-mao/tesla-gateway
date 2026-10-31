@@ -13,6 +13,7 @@ import (
 	mdns "github.com/miekg/dns"
 
 	"tesla-gateway/internal/logx"
+	tgstats "tesla-gateway/internal/stats"
 )
 
 const (
@@ -39,6 +40,8 @@ type ServerConfig struct {
 	// Logger receives structured query records. A nil logger gets a default
 	// JSON logger with module=dns.
 	Logger *logx.Logger
+	// Stats receives runtime counters. Nil disables stats accounting.
+	Stats *tgstats.Stats
 }
 
 type serverRuntime struct {
@@ -53,6 +56,7 @@ type Server struct {
 	listen string
 	cache  *Cache
 	logger *logx.Logger
+	stats  *tgstats.Stats
 
 	runtime atomic.Pointer[serverRuntime]
 
@@ -75,6 +79,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cache == nil {
 		cache = NewCache(0)
 	}
+	if cfg.Stats != nil {
+		cfg.Stats.SetCache(cache)
+	}
 	rewriter := cfg.Rewriter
 	if rewriter == nil {
 		rewriter = NewRewriter(nil, 0, false)
@@ -92,6 +99,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		listen: cfg.Listen,
 		cache:  cache,
 		logger: logger,
+		stats:  cfg.Stats,
 	}
 	s.runtime.Store(&serverRuntime{
 		local:    cfg.Local,
@@ -127,6 +135,14 @@ func (s *Server) Cache() *Cache {
 		return nil
 	}
 	return s.cache
+}
+
+// Stats returns the runtime counters attached to the server, if any.
+func (s *Server) Stats() *tgstats.Stats {
+	if s == nil {
+		return nil
+	}
+	return s.stats
 }
 
 // Addr returns the actual UDP listen address after Start.
@@ -312,13 +328,17 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 	if s == nil || req == nil {
 		return
 	}
+	s.stats.IncDNSQueries()
 
 	start := time.Now()
+	cacheHit := false
 	if req.Opcode != mdns.OpcodeQuery {
+		s.stats.IncDNSCacheMisses()
 		s.writeResponse(w, req, errorReply(req, mdns.RcodeNotImplemented))
 		return
 	}
 	if len(req.Question) != 1 {
+		s.stats.IncDNSCacheMisses()
 		s.writeResponse(w, req, errorReply(req, mdns.RcodeFormatError))
 		return
 	}
@@ -366,6 +386,7 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 			resp = replyFromCached(req, cached)
 			source = "cache"
 			queryErr = nil
+			cacheHit = true
 		}
 	}
 
@@ -382,8 +403,10 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 				upstreamReq := req.Copy()
 				upstreamReq.Response = false
 
+				s.stats.IncDNSUpstreamQueries()
 				upstreamResp, err := messageResolver.ExchangeMessage(ctx, upstreamReq)
 				if err != nil {
+					s.stats.IncDNSUpstreamErrors()
 					queryErr = err
 					resp = errorReply(req, mdns.RcodeServerFailure)
 				} else if upstreamResp != nil {
@@ -393,9 +416,11 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 					resp = replyFromUpstream(req, upstreamResp)
 				}
 			} else {
+				s.stats.IncDNSUpstreamQueries()
 				records, hit, err := runtime.upstream.Lookup(ctx, q)
 				switch {
 				case err != nil:
+					s.stats.IncDNSUpstreamErrors()
 					queryErr = err
 					resp = errorReply(req, mdns.RcodeServerFailure)
 				case hit:
@@ -419,6 +444,14 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 		resp, translations = runtime.rewriter.RewriteWithTranslations(resp)
 	} else {
 		resp = resp.Copy()
+	}
+
+	// Count hit/miss before sending the response so a client that immediately
+	// inspects the stats sees this query.
+	if cacheHit {
+		s.stats.IncDNSCacheHits()
+	} else {
+		s.stats.IncDNSCacheMisses()
 	}
 
 	if err := s.writeResponse(w, req, resp); err != nil {

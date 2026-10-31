@@ -12,6 +12,10 @@ mappings:
 real_prefixes:
   - "192.168.0.0/16"
 
+# Runtime statistics for LuCI (atomically replaced JSON). Empty uses
+# /var/run/tesla-gateway/stats.json.
+stats_path: "/var/run/tesla-gateway/stats.json"
+
 dns:
   listen: "0.0.0.0:53"
   resolvers: [hosts, lease, system]

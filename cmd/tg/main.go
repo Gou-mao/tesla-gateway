@@ -20,7 +20,12 @@ import (
 	"tesla-gateway/internal/mapping"
 	"tesla-gateway/internal/netlink"
 	tgproxy "tesla-gateway/internal/proxy"
+	"tesla-gateway/internal/stats"
 )
+
+// version is reported in the stats file. It can be overridden at build time
+// with -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	os.Exit(run())
@@ -60,6 +65,7 @@ func run() int {
 		return 1
 	}
 	logger = logger.WithModule("main")
+	runtimeStats := stats.New()
 
 	engine := mapping.NewEngine(cfg.Strategy)
 	if err := engine.Validate(); err != nil {
@@ -89,6 +95,7 @@ func run() int {
 		logger.Warn("dns.listen is empty; DNS service is disabled", nil)
 	} else {
 		cache = tgdns.NewCache(cfg.DNS.CacheMax)
+		runtimeStats.SetCache(cache)
 		runtime, err := buildDNSRuntime(cfg, engine)
 		if err != nil {
 			logger.Error("failed to build DNS resolver chain", logx.Fields{
@@ -104,6 +111,7 @@ func run() int {
 			Cache:    cache,
 			Rewriter: runtime.rewriter,
 			Logger:   logger.WithModule("dns"),
+			Stats:    runtimeStats,
 		})
 		if err != nil {
 			logger.Error("failed to create DNS server", logx.Fields{
@@ -141,6 +149,7 @@ func run() int {
 			KeepAlive:   cfg.Proxy.KeepAlive,
 			MaxConns:    cfg.Proxy.MaxConns,
 			IdleTimeout: cfg.Proxy.IdleTimeout,
+			Stats:       runtimeStats,
 		}, engine, logger)
 		if err != nil {
 			if server != nil {
@@ -237,6 +246,46 @@ func run() int {
 		return 0
 	}
 
+	var statsWriterDone <-chan struct{}
+	mappedPrefixes := engine.MappedPrefixes()
+	reportedPrefixes := make([]string, 0, len(mappedPrefixes))
+	for _, prefix := range mappedPrefixes {
+		reportedPrefixes = append(reportedPrefixes, prefix.String())
+	}
+	listeners := stats.Listeners{}
+	if server != nil {
+		listeners.DNS = server.Addr()
+	}
+	if tcpProxy != nil {
+		listeners.Proxy = tcpProxy.Addr()
+	}
+
+	statsWriter, err := stats.NewWriter(stats.WriterConfig{
+		Path:           cfg.StatsPath,
+		Version:        version,
+		Listeners:      listeners,
+		MappedPrefixes: reportedPrefixes,
+	}, runtimeStats, logger.WithModule("stats"))
+	if err != nil {
+		// Stats publication is best-effort; it must never prevent the gateway
+		// from serving traffic.
+		logger.Warn("failed to initialize stats writer; continuing without runtime stats", logx.Fields{
+			"path":  cfg.StatsPath,
+			"error": err.Error(),
+		})
+	} else {
+		logger.Info("stats writer started", logx.Fields{
+			"path":     statsWriter.Path(),
+			"interval": statsWriter.Interval().String(),
+		})
+		done := make(chan struct{})
+		statsWriterDone = done
+		go func() {
+			defer close(done)
+			statsWriter.Run(rootCtx)
+		}()
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
@@ -259,7 +308,6 @@ func run() int {
 		break
 	}
 
-	cancelRoot()
 	exitCode := 0
 	if nftApplied {
 		if err := netlink.Cleanup(nil); err != nil {
@@ -288,6 +336,12 @@ func run() int {
 			})
 			exitCode = 1
 		}
+	}
+	// Stop the publisher after the services are down so the final snapshot
+	// reflects the drained connection counters. Run writes it on cancel.
+	cancelRoot()
+	if statsWriterDone != nil {
+		<-statsWriterDone
 	}
 	logger.Info("tesla-gateway stopped", nil)
 	return exitCode
@@ -377,6 +431,12 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 		logger.Warn("dns.cache_max changed; restart is required to resize the cache", logx.Fields{
 			"old": current.DNS.CacheMax,
 			"new": next.DNS.CacheMax,
+		})
+	}
+	if next.StatsPath != current.StatsPath {
+		logger.Warn("stats_path changed; restart is required to move the stats file", logx.Fields{
+			"old": current.StatsPath,
+			"new": next.StatsPath,
 		})
 	}
 

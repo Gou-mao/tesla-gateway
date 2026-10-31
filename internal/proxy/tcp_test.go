@@ -14,6 +14,7 @@ import (
 
 	"tesla-gateway/internal/logx"
 	"tesla-gateway/internal/mapping"
+	"tesla-gateway/internal/stats"
 )
 
 func newTestMapping(t *testing.T) (*mapping.Engine, netip.Addr) {
@@ -103,7 +104,7 @@ func (s *testTCPServer) Close() {
 	s.wg.Wait()
 }
 
-func startTestProxy(t *testing.T, engine *mapping.Engine, origDst OriginalDstFunc, relayFn relayFunc, idle time.Duration) (*TCPProxy, netip.AddrPort, *bytes.Buffer) {
+func startTestProxy(t *testing.T, engine *mapping.Engine, origDst OriginalDstFunc, relayFn relayFunc, idle time.Duration, runtimeStats ...*stats.Stats) (*TCPProxy, netip.AddrPort, *bytes.Buffer) {
 	t.Helper()
 	var logs bytes.Buffer
 	logger, err := logx.New(logx.Config{
@@ -114,12 +115,17 @@ func startTestProxy(t *testing.T, engine *mapping.Engine, origDst OriginalDstFun
 		t.Fatalf("create logger: %v", err)
 	}
 
+	var st *stats.Stats
+	if len(runtimeStats) > 0 {
+		st = runtimeStats[0]
+	}
 	p, err := NewTCPProxy(TCPConfig{
 		Listen:      "127.0.0.1:0",
 		KeepAlive:   time.Second,
 		MaxConns:    16,
 		IdleTimeout: idle,
 		DialTimeout: 2 * time.Second,
+		Stats:       st,
 	}, engine, logger, WithOriginalDst(origDst))
 	if err != nil {
 		t.Fatalf("create proxy: %v", err)

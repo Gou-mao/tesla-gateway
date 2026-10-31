@@ -13,6 +13,7 @@ import (
 
 	"tesla-gateway/internal/logx"
 	"tesla-gateway/internal/mapping"
+	tgstats "tesla-gateway/internal/stats"
 )
 
 const (
@@ -36,6 +37,8 @@ type TCPConfig struct {
 	IdleTimeout time.Duration
 	// DialTimeout bounds upstream connection establishment. Zero uses 10s.
 	DialTimeout time.Duration
+	// Stats receives runtime counters. Nil disables stats accounting.
+	Stats *tgstats.Stats
 }
 
 // OriginalDstFunc resolves the pre-redirect destination of an accepted
@@ -49,6 +52,7 @@ type TCPProxy struct {
 	cfg       TCPConfig
 	engine    *mapping.Engine
 	logger    *logx.Logger
+	stats     *tgstats.Stats
 	origDstFn OriginalDstFunc
 	relayFn   relayFunc
 
@@ -108,6 +112,7 @@ func NewTCPProxy(cfg TCPConfig, engine *mapping.Engine, logger *logx.Logger, opt
 		cfg:       cfg,
 		engine:    engine,
 		logger:    logger,
+		stats:     cfg.Stats,
 		origDstFn: OriginalDst,
 		relayFn:   relayWith,
 		conns:     make(map[*net.TCPConn]struct{}),
@@ -136,6 +141,14 @@ func (p *TCPProxy) Addr() string {
 		return ""
 	}
 	return p.ln.Addr().String()
+}
+
+// Stats returns the runtime counters attached to the proxy, if any.
+func (p *TCPProxy) Stats() *tgstats.Stats {
+	if p == nil {
+		return nil
+	}
+	return p.stats
 }
 
 // Start binds the listener and starts the accept loop. It returns once the
@@ -275,6 +288,7 @@ func (p *TCPProxy) handleConn(ctx context.Context, client *net.TCPConn) {
 
 	realIP, ok := p.engine.Reverse(dst.Addr())
 	if !ok {
+		p.stats.IncProxyRejectedNoMapping()
 		fields["success"] = false
 		p.logger.Warn("tcp proxy has no mapping for original destination", fields)
 		return
@@ -310,6 +324,10 @@ func (p *TCPProxy) handleConn(ctx context.Context, client *net.TCPConn) {
 		return
 	}
 	defer p.untrack(upstream)
+
+	p.stats.IncProxyTotalConns()
+	p.stats.IncProxyActiveConns()
+	defer p.stats.DecProxyActiveConns()
 
 	idle := newIdleWatch(p.cfg.IdleTimeout, client, upstream)
 	if idle != nil {
@@ -356,6 +374,13 @@ func (p *TCPProxy) handleConn(ctx context.Context, client *net.TCPConn) {
 		_ = client.CloseWrite()
 	}()
 	wg.Wait()
+
+	if upBytes > 0 {
+		p.stats.AddProxyBytesClientToUpstream(uint64(upBytes))
+	}
+	if downBytes > 0 {
+		p.stats.AddProxyBytesUpstreamToClient(uint64(downBytes))
+	}
 
 	_ = client.Close()
 	_ = upstream.Close()

@@ -13,8 +13,13 @@ import (
 	"tesla-gateway/internal/mapping"
 )
 
-// DefaultPath is the default configuration file path.
-const DefaultPath = "/etc/tesla-gateway/config.yaml"
+const (
+	// DefaultPath is the default configuration file path.
+	DefaultPath = "/etc/tesla-gateway/config.yaml"
+	// DefaultStatsPath is the default runtime statistics file published for
+	// management frontends such as LuCI.
+	DefaultStatsPath = "/var/run/tesla-gateway/stats.json"
+)
 
 // DefaultLocalClientPrefix is the local Tesla client network. It is excluded
 // from the nftables redirect set so local clients are never intercepted.
@@ -29,6 +34,9 @@ type Config struct {
 	// RealPrefixes declares real, in-use network prefixes. Mapped (to)
 	// prefixes must not overlap them.
 	RealPrefixes []string `yaml:"real_prefixes"`
+	// StatsPath is where runtime statistics are published as JSON. Empty uses
+	// DefaultStatsPath.
+	StatsPath string `yaml:"stats_path"`
 
 	DNS   DNSConfig   `yaml:"dns"`
 	Proxy ProxyConfig `yaml:"proxy"`
@@ -102,6 +110,10 @@ func Parse(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
+	}
+	cfg.StatsPath = strings.TrimSpace(cfg.StatsPath)
+	if cfg.StatsPath == "" {
+		cfg.StatsPath = DefaultStatsPath
 	}
 	cfg.Proxy.applyDefaults()
 	if err := cfg.compileMapping(); err != nil {

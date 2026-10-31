@@ -76,6 +76,28 @@ func (c *Cache) Len() int {
 	return c.lru.Len()
 }
 
+// Size returns the number of currently valid (unexpired) entries. Expired
+// entries encountered while counting are removed from the cache.
+func (c *Cache) Size() int {
+	if c == nil {
+		return 0
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.now()
+	for element := c.lru.Back(); element != nil; {
+		previous := element.Prev()
+		entry := element.Value.(*cacheEntry)
+		if !now.Before(entry.expiry) {
+			c.removeElement(element)
+		}
+		element = previous
+	}
+	return c.lru.Len()
+}
+
 // Clear removes all entries.
 func (c *Cache) Clear() {
 	if c == nil {
