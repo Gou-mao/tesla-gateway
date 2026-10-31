@@ -345,3 +345,11 @@ rm -rf /etc/tesla-gateway
 - DNS 与代理共享 mapping，但各自独立运行。
 - **无 TLS 解密、无 TLS termination、无 SNI/Host 改写、无应用层 inspection。**
   如果将来需要 HTTPS 审计，应作为另一个产品实现，不得加入本项目。
+
+## License
+
+本项目以 **MIT** 协议开源，见 [LICENSE](LICENSE)。
+
+第三方依赖均为宽松许可：`github.com/miekg/dns`（BSD-3-Clause）、
+`golang.org/x/sys` / `golang.org/x/net`（BSD-3-Clause）、`gopkg.in/yaml.v3`
+（Apache-2.0 / MIT）。使用时请各自遵循其许可证并保留版权声明。
