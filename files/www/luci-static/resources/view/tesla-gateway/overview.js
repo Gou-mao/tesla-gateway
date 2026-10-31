@@ -10,6 +10,7 @@ var INIT = '/etc/init.d/tesla-gateway';
 var CONFIG = '/etc/tesla-gateway/config.yaml';
 var STATS = '/var/run/tesla-gateway/stats.json';
 var NFT = '/usr/sbin/nft';
+var TG_BIN = '/usr/sbin/tesla-gateway';
 
 function readStats() {
 	return L.resolveDefault(fs.read(STATS), null).then(function(raw) {
@@ -119,6 +120,105 @@ function parseIPv4(value) {
 	}
 
 	return octets;
+}
+
+function isIPv4Text(value) {
+	var text = String(value == null ? '' : value).trim();
+
+	/* Reject leading zeros so the frontend matches netip.ParseAddr in Go. */
+	if (!/^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(text))
+		return false;
+
+	return parseIPv4(text) != null;
+}
+
+function isIPv6Text(value) {
+	var text = String(value == null ? '' : value).trim();
+	var zone = text.indexOf('%');
+
+	if (zone >= 0) {
+		if (zone === 0 || zone === text.length - 1 || text.indexOf('%', zone + 1) >= 0)
+			return false;
+
+		text = text.slice(0, zone);
+	}
+
+	if (text.indexOf(':') < 0 || !/^[0-9A-Fa-f:.]+$/.test(text))
+		return false;
+
+	function countGroups(part) {
+		if (part === '')
+			return 0;
+
+		var groups = part.split(':');
+		var count = 0;
+
+		for (var i = 0; i < groups.length; i++) {
+			var group = groups[i];
+
+			if (group === '')
+				return -1;
+
+			if (group.indexOf('.') >= 0) {
+				if (i !== groups.length - 1 || !isIPv4Text(group))
+					return -1;
+
+				count += 2;
+			}
+			else {
+				if (!/^[0-9A-Fa-f]{1,4}$/.test(group))
+					return -1;
+
+				count++;
+			}
+		}
+
+		return count;
+	}
+
+	var halves = text.split('::');
+
+	if (halves.length > 2)
+		return false;
+
+	var head = countGroups(halves[0]);
+
+	if (head < 0)
+		return false;
+
+	if (halves.length === 2) {
+		var tail = countGroups(halves[1]);
+
+		if (tail < 0)
+			return false;
+
+		return head + tail <= 7;
+	}
+
+	return head === 8;
+}
+
+function normalizeUpstreamValue(value) {
+	var text = String(value == null ? '' : value).trim();
+	var lower = text.toLowerCase();
+
+	return (lower === 'dhcp' || lower === 'auto') ? lower : text;
+}
+
+function isValidUpstreamValue(value) {
+	var text = normalizeUpstreamValue(value);
+
+	if (text === 'dhcp' || text === 'auto')
+		return true;
+
+	return isIPv4Text(text) || isIPv6Text(text);
+}
+
+function upstreamKey(value) {
+	var text = normalizeUpstreamValue(value).toLowerCase();
+
+	/* dhcp and auto are aliases and must not be stored twice. */
+	return (text === 'auto' || text === 'dhcp') ? 'dhcp' : text;
 }
 
 function parseCIDR(value) {
@@ -440,6 +540,10 @@ return view.extend({
 		var uciState = data[4];
 		var refs = {};
 		var actionState = { busy: false, running: null };
+		var upstreamItems = [];
+		var upstreamInitialized = false;
+		var upstreamDirty = false;
+		var upstreamPending = null;
 		var root = null;
 		var refreshing = false;
 
@@ -461,7 +565,37 @@ return view.extend({
 		refs.dhcpDNS = E('span', {}, [ _('—') ]);
 		refs.dhcpRouter = E('span', {}, [ _('—') ]);
 		refs.dnsListen = E('span', {}, [ _('—') ]);
-		refs.dnsUpstream = E('span', {}, [ _('—') ]);
+		refs.dnsUpstreamList = E('div', {});
+		refs.dnsUpstreamError = E('div', {
+			'style': 'display: none; color: #d9534f; margin-top: .35em;'
+		});
+		refs.dnsUpstreamInput = E('input', {
+			'class': 'cbi-input-text',
+			'type': 'text',
+			'placeholder': _('IPv4 / IPv6 或 dhcp'),
+			'style': 'flex: 1; min-width: 12em;'
+		});
+		refs.dnsUpstreamAdd = E('button', {
+			'type': 'button',
+			'class': 'cbi-button cbi-button-add',
+			'style': 'margin-left: .4em;'
+		}, [ _('添加') ]);
+		refs.dnsUpstreamSave = E('button', {
+			'type': 'button',
+			'class': 'cbi-button cbi-button-apply important'
+		}, [ _('保存') ]);
+		refs.dnsUpstream = E('div', {}, [
+			E('p', {
+				'class': 'cbi-value-description',
+				'style': 'margin: 0 0 .5em;'
+			}, [ _('按从上到下的顺序尝试上游，序号即优先级。') ]),
+			refs.dnsUpstreamList,
+			refs.dnsUpstreamError,
+			E('div', {
+				'style': 'display: flex; align-items: center; gap: .4em; margin-top: .5em;'
+			}, [ refs.dnsUpstreamInput, refs.dnsUpstreamAdd ]),
+			E('div', { 'style': 'margin-top: .5em;' }, [ refs.dnsUpstreamSave ])
+		]);
 		refs.dnsUpstreamEffective = E('span', {}, [ _('—') ]);
 		refs.mappingStrategy = E('span', {}, [ _('—') ]);
 		refs.queries = E('span', {}, [ _('—') ]);
@@ -503,6 +637,9 @@ return view.extend({
 			stopBtn.disabled = actionState.busy || actionState.running === false;
 			restartBtn.disabled = actionState.busy;
 			saveBtn.disabled = actionState.busy || config == null;
+			refs.dnsUpstreamInput.disabled = actionState.busy;
+			refs.dnsUpstreamAdd.disabled = actionState.busy;
+			refs.dnsUpstreamSave.disabled = actionState.busy;
 		}
 
 		function renderMappings(mappings) {
@@ -537,6 +674,272 @@ return view.extend({
 					E('td', { 'class': 'td' }, [ E('code', {}, [ to ]) ]),
 					E('td', { 'class': 'td' }, [ explainMapping(from, to) ])
 				]));
+			});
+		}
+
+		function setUpstreamError(message) {
+			if (message) {
+				refs.dnsUpstreamError.textContent = message;
+				refs.dnsUpstreamError.style.display = '';
+			}
+			else {
+				refs.dnsUpstreamError.textContent = '';
+				refs.dnsUpstreamError.style.display = 'none';
+			}
+		}
+
+		function sameUpstreamList(left, right) {
+			if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length)
+				return false;
+
+			for (var i = 0; i < left.length; i++) {
+				if (String(left[i]) !== String(right[i]))
+					return false;
+			}
+
+			return true;
+		}
+
+		function renderUpstreamEditor() {
+			while (refs.dnsUpstreamList.firstChild)
+				refs.dnsUpstreamList.removeChild(refs.dnsUpstreamList.firstChild);
+
+			if (!upstreamItems.length) {
+				refs.dnsUpstreamList.appendChild(E('div', {
+					'class': 'cbi-value-description',
+					'style': 'font-style: italic;'
+				}, [ _('列表为空。请输入 IP 或 dhcp 后点击「添加」。') ]));
+			}
+
+			upstreamItems.forEach(function(value, index) {
+				var upBtn = E('button', {
+					'type': 'button',
+					'class': 'cbi-button cbi-button-neutral',
+					'title': _('上移'),
+					'style': 'margin-left: .35em; padding: 0 .45em;'
+				}, [ '↑' ]);
+				var downBtn = E('button', {
+					'type': 'button',
+					'class': 'cbi-button cbi-button-neutral',
+					'title': _('下移'),
+					'style': 'margin-left: .35em; padding: 0 .45em;'
+				}, [ '↓' ]);
+				var deleteBtn = E('button', {
+					'type': 'button',
+					'class': 'cbi-button cbi-button-reset',
+					'title': _('删除'),
+					'style': 'margin-left: .35em;'
+				}, [ _('删除') ]);
+
+				upBtn.disabled = actionState.busy || index === 0;
+				downBtn.disabled = actionState.busy || index === upstreamItems.length - 1;
+				deleteBtn.disabled = actionState.busy;
+
+				upBtn.addEventListener('click', function(ev) {
+					ev.preventDefault();
+					moveUpstreamItem(index, -1);
+				});
+				downBtn.addEventListener('click', function(ev) {
+					ev.preventDefault();
+					moveUpstreamItem(index, 1);
+				});
+				deleteBtn.addEventListener('click', function(ev) {
+					ev.preventDefault();
+					removeUpstreamItem(index);
+				});
+
+				refs.dnsUpstreamList.appendChild(E('div', {
+					'style': 'display: flex; align-items: center; padding: .25em 0; border-bottom: 1px solid rgba(0, 0, 0, .06);'
+				}, [
+					E('span', {
+						'style': 'min-width: 2em; color: #666;'
+					}, [ String(index + 1) + '.' ]),
+					E('code', {
+						'style': 'flex: 1; word-break: break-all;'
+					}, [ value ]),
+					upBtn,
+					downBtn,
+					deleteBtn
+				]));
+			});
+		}
+
+		function moveUpstreamItem(index, offset) {
+			var target = index + offset;
+
+			if (actionState.busy || target < 0 || target >= upstreamItems.length)
+				return;
+
+			var item = upstreamItems[index];
+			upstreamItems[index] = upstreamItems[target];
+			upstreamItems[target] = item;
+			upstreamDirty = true;
+			upstreamPending = null;
+			setUpstreamError('');
+			renderUpstreamEditor();
+		}
+
+		function removeUpstreamItem(index) {
+			if (actionState.busy)
+				return;
+
+			upstreamItems.splice(index, 1);
+			upstreamDirty = true;
+			upstreamPending = null;
+			setUpstreamError(upstreamItems.length ? '' : _('DNS 上游列表不能为空，请至少添加一项。'));
+			renderUpstreamEditor();
+		}
+
+		function addUpstreamItem() {
+			if (actionState.busy)
+				return;
+
+			var value = normalizeUpstreamValue(refs.dnsUpstreamInput.value);
+
+			if (!value) {
+				setUpstreamError(_('请输入 IP 地址或 dhcp/auto。'));
+				return;
+			}
+
+			if (!isValidUpstreamValue(value)) {
+				setUpstreamError(_('无效的 DNS 上游：') + value +
+					_('（请输入 IPv4/IPv6 地址或 dhcp/auto）'));
+				return;
+			}
+
+			for (var i = 0; i < upstreamItems.length; i++) {
+				if (upstreamKey(upstreamItems[i]) === upstreamKey(value)) {
+					setUpstreamError(_('该上游已在列表中。'));
+					return;
+				}
+			}
+
+			upstreamItems.push(value);
+			upstreamDirty = true;
+			upstreamPending = null;
+			refs.dnsUpstreamInput.value = '';
+			setUpstreamError('');
+			renderUpstreamEditor();
+			refs.dnsUpstreamInput.focus();
+		}
+
+		function validateUpstreamItems() {
+			if (!upstreamItems.length) {
+				setUpstreamError(_('DNS 上游列表不能为空，请至少添加一项。'));
+				return false;
+			}
+
+			for (var i = 0; i < upstreamItems.length; i++) {
+				if (!isValidUpstreamValue(upstreamItems[i])) {
+					setUpstreamError(_('第 ') + (i + 1) + _(' 项无效：') +
+						upstreamItems[i] + _('（须为 IPv4/IPv6 地址或 dhcp/auto）'));
+					return false;
+				}
+			}
+
+			setUpstreamError('');
+			return true;
+		}
+
+		function syncUpstreamFromStats(list) {
+			var next = Array.isArray(list)
+				? list.map(function(item) { return String(item); })
+				: [];
+
+			if (!upstreamInitialized) {
+				upstreamInitialized = true;
+
+				if (upstreamDirty)
+					return;
+
+				upstreamItems = next;
+				upstreamPending = null;
+				renderUpstreamEditor();
+				return;
+			}
+
+			if (upstreamDirty) {
+				if (upstreamPending != null && sameUpstreamList(next, upstreamPending)) {
+					upstreamItems = next;
+					upstreamDirty = false;
+					upstreamPending = null;
+					setUpstreamError('');
+					renderUpstreamEditor();
+				}
+				return;
+			}
+
+			if (!sameUpstreamList(upstreamItems, next)) {
+				upstreamItems = next;
+				renderUpstreamEditor();
+			}
+		}
+
+		function saveUpstream() {
+			if (actionState.busy)
+				return Promise.resolve();
+
+			if (!validateUpstreamItems())
+				return Promise.resolve();
+
+			var values = [];
+			var seen = {};
+
+			upstreamItems.forEach(function(item) {
+				var value = normalizeUpstreamValue(item);
+				var key = upstreamKey(value);
+
+				if (Object.prototype.hasOwnProperty.call(seen, key))
+					return;
+
+				seen[key] = true;
+				values.push(value);
+			});
+
+			var written = false;
+			var restarted = false;
+
+			actionState.busy = true;
+			syncButtons();
+
+			return fs.exec(TG_BIN, [
+				'--config', CONFIG,
+				'--set-upstream', values.join(',')
+			]).then(function(result) {
+				if (!result || result.code !== 0)
+					throw new Error(commandFailure(result));
+
+				written = true;
+				return fs.exec(INIT, [ 'restart' ]);
+			}).then(function(result) {
+				if (!result || result.code !== 0)
+					throw new Error(commandFailure(result));
+
+				restarted = true;
+				upstreamItems = values.slice();
+				upstreamPending = values.slice();
+				upstreamDirty = true;
+				setUpstreamError('');
+				renderUpstreamEditor();
+				ui.addNotification(null, E('p', {}, [
+					_('DNS 上游已保存，服务正在重启。')
+				]), 'success');
+				return refresh();
+			}).catch(function(err) {
+				var message = err && err.message ? err.message : String(err);
+				var prefix = written
+					? (restarted ? _('配置已写入，但刷新数据失败：') : _('配置已写入，但重启失败：'))
+					: _('保存失败：');
+
+				actionState.busy = false;
+				syncButtons();
+				setUpstreamError(prefix + message);
+				ui.addNotification(null, E('p', {}, [
+					_('保存 DNS 上游失败：') + message
+				]), 'danger');
+			}).then(function() {
+				actionState.busy = false;
+				syncButtons();
 			});
 		}
 
@@ -595,9 +998,8 @@ return view.extend({
 			refs.dnsListen.textContent = currentStats
 				? (currentStats.dns_listen || listeners.dns || _('禁用'))
 				: _('—');
-			refs.dnsUpstream.textContent = upstream.length
-				? upstream.join(', ')
-				: (currentStats ? _('未配置') : _('—'));
+			if (currentStats && Array.isArray(currentStats.dns_upstream))
+				syncUpstreamFromStats(upstream);
 			refs.dnsUpstreamEffective.textContent = currentStats
 				? (upstreamEffective.length
 					? upstreamEffective.join(', ')
@@ -698,6 +1100,23 @@ return view.extend({
 			saveConfig();
 		});
 
+		refs.dnsUpstreamAdd.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			addUpstreamItem();
+		});
+
+		refs.dnsUpstreamSave.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			saveUpstream();
+		});
+
+		refs.dnsUpstreamInput.addEventListener('keydown', function(ev) {
+			if (ev.key === 'Enter' || ev.keyCode === 13) {
+				ev.preventDefault();
+				addUpstreamItem();
+			}
+		});
+
 		function stopPolling() {
 			window.setTimeout(function() {
 				poll.remove(refresh);
@@ -762,7 +1181,7 @@ return view.extend({
 
 		var dnsTable = table([
 			tableRow(_('监听地址'), refs.dnsListen),
-			tableRow(_('上游服务器（配置）'), refs.dnsUpstream),
+			tableRow(_('DNS 上游（配置）'), refs.dnsUpstream),
 			tableRow(_('上游服务器（实际生效）'), refs.dnsUpstreamEffective),
 			tableRow(_('映射策略'), refs.mappingStrategy)
 		]);
@@ -842,6 +1261,7 @@ return view.extend({
 		]);
 
 		applyDHCP();
+		renderUpstreamEditor();
 		applyLive(stats, status, nft);
 
 		poll.add(refresh, 4);

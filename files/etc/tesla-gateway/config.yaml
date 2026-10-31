@@ -23,7 +23,7 @@ dns:
   # stawan/modem) via `ubus call network.interface dump`, cached for ~10s.
   # If ubus is unavailable or no interface has dns-server, it is skipped.
   # The list is tried from top to bottom; failure/timeout moves to the next.
-  upstream: ["dhcp", "223.5.5.5", "119.29.29.29"]
+  upstream: ["223.5.5.5", "119.29.29.29", "dhcp"]
   hosts_path: "/etc/hosts"
   lease_path: "/tmp/dhcp.leases"
   clamp_ttl: 300

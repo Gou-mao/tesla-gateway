@@ -111,6 +111,13 @@ dns:
   upstream: ["dhcp", "223.5.5.5", "119.29.29.29"]
 ```
 
+LuCI 的 DNS 区块把这份列表显示为可编辑的有序列表：用 `↑` / `↓` 调整优先级、
+`删除` 移除、底部输入框添加，然后点「保存」。保存时页面先执行
+`/usr/sbin/tesla-gateway --config /etc/tesla-gateway/config.yaml --set-upstream "..."`，
+由该命令完成校验、去重和原子行替换（只改 `upstream:` 那一行，保留其余内容），
+成功后页面再重启服务。该命令行模式改完配置即退出，不会启动 daemon；参数非法时
+向 stderr 报错并以非 0 退出。
+
 在 OpenWrt 上，网关执行 `ubus call network.interface dump`，从 `interface[]` 中选择
 `up=true` 且带 `dns-server` 的接口；优先使用有默认路由（`target=0.0.0.0/0`，例如
 `stawan`/`modem`）的接口，没有默认路由时回退到第一个可用接口。展开结果按原数组顺序
@@ -298,8 +305,8 @@ ssh root@192.168.1.1 '
 `/cgi-bin/luci/admin/services/tesla-gateway`）。页面按「状态 → 转发映射 →
 DHCP 下发 → DNS → 统计 → 设置」排列：转发映射直接回答「什么网段变成什么
 网段」，DHCP 区块由 LuCI 的 `dhcp` / `network` UCI 配置算出网关、地址池、
-租期以及实际下发的 option 3 / option 6，DNS 区块同时展示配置的 `dns.upstream`
-（可能包含 `dhcp` 关键字）和当前实际生效的 IP 列表 `dns_upstream_effective`。
+租期以及实际下发的 option 3 / option 6，DNS 区块同时展示可编辑的配置 `dns.upstream`
+（可能包含 `dhcp` 关键字）和只读的当前实际生效 IP 列表 `dns_upstream_effective`。
 服务状态、`stats.json` 统计和 nft 表状态每 4 秒刷新；页面提供启动 /
 停止 / 重启按钮，以及 `/etc/tesla-gateway/config.yaml` 文本编辑和「保存并
 重启」。
@@ -320,9 +327,11 @@ ACL 说明：
 - `fs.read` / `fs.write` 由 rpcd 的 `file` 对象按 ACL 里的**真实文件路径**检查。
   `fs.exec` 不是给 `ubus.file` 授权，而是给要执行的**可执行文件路径**加
   `"exec"`，例如：
-  `"/etc/init.d/tesla-gateway": [ "exec" ]`、`"/usr/sbin/nft": [ "exec" ]`。
-  本项目的 read 段放行 init.d / nft 的 exec，write 段再次放行 init.d exec，
-  以覆盖「查看状态」和「启动 / 停止 / 重启」两类调用。
+  `"/etc/init.d/tesla-gateway": [ "exec" ]`、`"/usr/sbin/nft": [ "exec" ]`、
+  `"/usr/sbin/tesla-gateway": [ "exec" ]`。
+  本项目的 read 段放行 init.d / nft / tesla-gateway 的 exec，write 段再次
+  放行 init.d 和 tesla-gateway 的 exec，以覆盖「查看状态」「启动 / 停止 /
+  重启」以及「保存 DNS 上游顺序」几类调用。
 - OpenWrt 的 `/var` 通常指向 `/tmp`，较新的 rpcd 会先 `realpath()` 再复检
   ACL 目标路径。因此 ACL 同时列出 `/var/run/tesla-gateway/stats.json`、
   `/tmp/run/tesla-gateway/stats.json` 和 `/tmp/tesla-gateway/stats.json`；

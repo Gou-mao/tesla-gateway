@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -33,15 +34,25 @@ func main() {
 }
 
 func run() int {
+	configPath := flag.String("config", config.DefaultPath, "path to the YAML configuration file")
+	setUpstream := &setUpstreamFlag{}
+	flag.Var(setUpstream, "set-upstream", "replace dns.upstream with an ordered comma-separated list (IPv4/IPv6 or dhcp/auto) and exit")
+	flag.Parse()
+
+	if setUpstream.set {
+		if err := updateConfigUpstream(*configPath, setUpstream.value); err != nil {
+			fmt.Fprintf(os.Stderr, "tesla-gateway: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
 	bootstrap, err := logx.New(logx.Config{})
 	if err != nil {
 		// The default logger cannot fail, but avoid a nil dereference if the
 		// logger implementation changes.
 		os.Exit(1)
 	}
-
-	configPath := flag.String("config", config.DefaultPath, "path to the YAML configuration file")
-	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -348,6 +359,197 @@ func run() int {
 	}
 	logger.Info("tesla-gateway stopped", nil)
 	return exitCode
+}
+
+// setUpstreamFlag records whether --set-upstream was supplied, including an
+// explicitly empty value (which must be rejected instead of starting the
+// daemon).
+type setUpstreamFlag struct {
+	value string
+	set   bool
+}
+
+func (f *setUpstreamFlag) String() string {
+	if f == nil {
+		return ""
+	}
+	return f.value
+}
+
+func (f *setUpstreamFlag) Set(value string) error {
+	f.value = value
+	f.set = true
+	return nil
+}
+
+// updateConfigUpstream validates raw, replaces the dns.upstream line in the
+// configuration file at path, and writes the file atomically. All other lines,
+// including comments, are preserved verbatim.
+func updateConfigUpstream(path, raw string) error {
+	if strings.TrimSpace(path) == "" {
+		path = config.DefaultPath
+	}
+
+	items, err := parseUpstreamItems(raw)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config %s: %w", path, err)
+	}
+	updated, err := replaceUpstreamLine(data, items)
+	if err != nil {
+		return fmt.Errorf("config %s: %w", path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat config %s: %w", path, err)
+	}
+	if err := writeFileAtomic(path, updated, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write config %s: %w", path, err)
+	}
+	return nil
+}
+
+// parseUpstreamItems parses an ordered comma-separated list of IPv4/IPv6
+// addresses and the keywords dhcp/auto (case-insensitive). Items are trimmed,
+// deduplicated while keeping their first position, and every item must be
+// valid. An empty list or an empty item is an error.
+func parseUpstreamItems(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf(`upstream list is empty; use an IPv4/IPv6 address or "dhcp"`)
+	}
+
+	parts := strings.Split(raw, ",")
+	items := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+
+	for i, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			return nil, fmt.Errorf("upstream item %d is empty", i+1)
+		}
+
+		var key string
+		switch lower := strings.ToLower(value); lower {
+		case "dhcp", "auto":
+			value = lower
+			// "auto" is an alias for "dhcp"; keep only the first spelling.
+			key = "dhcp"
+		default:
+			addr, err := netip.ParseAddr(value)
+			if err != nil {
+				return nil, fmt.Errorf(
+					`upstream item %d %q: must be an IPv4/IPv6 address or "dhcp" (alias "auto"): %w`,
+					i+1, value, err,
+				)
+			}
+			// Use the canonical address as the deduplication key so equivalent
+			// IPv6 spellings do not appear twice, but keep the user's first
+			// spelling in the file.
+			key = "ip:" + addr.String()
+		}
+
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		items = append(items, value)
+	}
+
+	if len(items) == 0 {
+		return nil, fmt.Errorf(`upstream list is empty; use an IPv4/IPv6 address or "dhcp"`)
+	}
+	return items, nil
+}
+
+// replaceUpstreamLine replaces the first active YAML line whose trimmed key is
+// upstream:, preserving the original indentation and line ending. Commented-out
+// lines are ignored.
+func replaceUpstreamLine(data []byte, items []string) ([]byte, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("upstream list is empty")
+	}
+
+	quoted := make([]string, len(items))
+	for i, item := range items {
+		quoted[i] = strconv.Quote(item)
+	}
+	value := "upstream: [" + strings.Join(quoted, ", ") + "]"
+
+	lines := strings.SplitAfter(string(data), "\n")
+	replaced := false
+	for i, line := range lines {
+		body := line
+		ending := ""
+		if strings.HasSuffix(body, "\n") {
+			body = strings.TrimSuffix(body, "\n")
+			ending = "\n"
+			if strings.HasSuffix(body, "\r") {
+				body = strings.TrimSuffix(body, "\r")
+				ending = "\r\n"
+			}
+		}
+
+		trimmed := strings.TrimSpace(body)
+		if strings.HasPrefix(trimmed, "#") || !isUpstreamKeyLine(trimmed) {
+			continue
+		}
+
+		indent := body[:len(body)-len(strings.TrimLeft(body, " \t"))]
+		lines[i] = indent + value + ending
+		replaced = true
+		break
+	}
+
+	if !replaced {
+		return nil, fmt.Errorf(`no active "upstream:" line found`)
+	}
+	return []byte(strings.Join(lines, "")), nil
+}
+
+func isUpstreamKeyLine(trimmed string) bool {
+	if !strings.HasPrefix(trimmed, "upstream:") {
+		return false
+	}
+	rest := strings.TrimPrefix(trimmed, "upstream:")
+	return rest == "" || strings.HasPrefix(rest, " ") || strings.HasPrefix(rest, "\t")
+}
+
+// writeFileAtomic writes data to a temporary file in the same directory and
+// renames it over path, so readers never observe a partially written file. The
+// original permission bits are preserved.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if err = tmp.Chmod(mode); err != nil {
+		return fmt.Errorf("chmod temporary file: %w", err)
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return fmt.Errorf("write temporary file: %w", err)
+	}
+	if err = tmp.Sync(); err != nil {
+		return fmt.Errorf("sync temporary file: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary file: %w", err)
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temporary file: %w", err)
+	}
+	return nil
 }
 
 func statsMeta(cfg *config.Config, version string, listeners stats.Listeners) stats.Meta {

@@ -9,6 +9,7 @@
 				"/tmp/tesla-gateway/stats.json": [ "read" ],
 				"/etc/tesla-gateway/config.yaml": [ "read" ],
 				"/etc/init.d/tesla-gateway": [ "exec" ],
+				"/usr/sbin/tesla-gateway": [ "exec" ],
 				"/usr/sbin/nft": [ "exec" ]
 			},
 			"ubus": {
@@ -18,7 +19,8 @@
 		"write": {
 			"file": {
 				"/etc/tesla-gateway/config.yaml": [ "write" ],
-				"/etc/init.d/tesla-gateway": [ "exec" ]
+				"/etc/init.d/tesla-gateway": [ "exec" ],
+				"/usr/sbin/tesla-gateway": [ "exec" ]
 			},
 			"ubus": {
 				"service": [ "list" ]

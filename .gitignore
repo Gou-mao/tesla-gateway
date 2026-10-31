@@ -6,3 +6,6 @@
 .DS_Store
 /tmp/
 tg
+
+# The "tg" rule above also matches the cmd/tg directory; keep its sources visible.
+!cmd/tg/
