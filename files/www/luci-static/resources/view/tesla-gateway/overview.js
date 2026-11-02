@@ -502,6 +502,33 @@ function getServiceState(serviceList) {
 	return { running: null, text: _('未知') };
 }
 
+function waitForServiceRunning(timeout, interval) {
+	var deadline = Date.now() + timeout;
+
+	function check() {
+		return L.resolveDefault(callServiceList('tesla-gateway'), null).then(function(status) {
+			if (getServiceState(status).running === true)
+				return true;
+
+			if (Date.now() >= deadline)
+				return false;
+
+			return new Promise(function(resolve) {
+				window.setTimeout(resolve, interval);
+			}).then(check);
+		}).catch(function() {
+			if (Date.now() >= deadline)
+				return false;
+
+			return new Promise(function(resolve) {
+				window.setTimeout(resolve, interval);
+			}).then(check);
+		});
+	}
+
+	return check();
+}
+
 function getNftState(result) {
 	if (!result)
 		return { text: _('未知'), cls: '', title: _('无法执行 nft 状态检查') };
@@ -1122,29 +1149,75 @@ return view.extend({
 			if (actionState.busy)
 				return Promise.resolve();
 
+			var previous = config != null ? String(config) : null;
 			var saved = false;
 
 			actionState.busy = true;
 			syncButtons();
 
-			return fs.write(CONFIG, textarea.value).then(function() {
+			function rollback(reason) {
+				if (!saved || previous == null)
+					return Promise.resolve(false);
+
+				return fs.write(CONFIG, previous).then(function() {
+					return fs.exec(INIT, [ 'restart' ]);
+				}).then(function(result) {
+					if (!result || result.code !== 0)
+						throw new Error(commandFailure(result));
+
+					config = previous;
+					textarea.value = previous;
+					ui.addNotification(null, E('p', {}, [
+						_('新配置未能使服务启动，已恢复旧配置并重启。原因：') + reason
+					]), 'danger');
+					return true;
+				}).catch(function(rollbackErr) {
+					var detail = rollbackErr && rollbackErr.message
+						? rollbackErr.message
+						: String(rollbackErr);
+
+					ui.addNotification(null, E('p', {}, [
+						_('新配置未能使服务启动，恢复旧配置也失败：') +
+						reason + _('；恢复失败：') + detail
+					]), 'danger');
+					return false;
+				});
+			}
+
+			return L.resolveDefault(fs.read(CONFIG), previous).then(function(current) {
+				if (current != null)
+					previous = String(current);
+
+				return fs.write(CONFIG, textarea.value);
+			}).then(function() {
 				saved = true;
 				return fs.exec(INIT, [ 'restart' ]);
 			}).then(function(result) {
 				if (!result || result.code !== 0)
 					throw new Error(commandFailure(result));
 
+				return waitForServiceRunning(10 * 1000, 500);
+			}).then(function(running) {
+				if (!running)
+					throw new Error(_('服务在重启后未能启动，配置可能无效。'));
+
+				config = textarea.value;
 				ui.addNotification(null, E('p', {}, [
 					_('配置已保存，服务正在重启。')
 				]), 'success');
 				reloadSoon(1200);
 			}).catch(function(err) {
+				var message = err && err.message ? err.message : String(err);
+
+				if (saved && previous != null)
+					return rollback(message);
+
+				ui.addNotification(null, E('p', {}, [
+					(saved ? _('配置已保存，但重启失败：') : _('保存失败：')) + message
+				]), 'danger');
+			}).then(function() {
 				actionState.busy = false;
 				syncButtons();
-				ui.addNotification(null, E('p', {}, [
-					(saved ? _('配置已保存，但重启失败：') : _('保存失败：')) +
-					(err && err.message ? err.message : err)
-				]), 'danger');
 			});
 		}
 

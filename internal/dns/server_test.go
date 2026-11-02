@@ -134,7 +134,7 @@ func TestServerCacheStoresRealAndRewritesOnOutput(t *testing.T) {
 		t.Errorf("upstream calls = %d, want 1 (second query served from cache)", got)
 	}
 
-	cached, ok := cache.Get(mdns.Question{Name: "nas.home.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET})
+	cached, ok := cache.Get(mdns.Question{Name: "nas.home.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET}, false, false)
 	if !ok {
 		t.Fatal("cache miss, want cached upstream response")
 	}

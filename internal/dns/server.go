@@ -344,6 +344,11 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 	}
 
 	q := req.Question[0]
+	do := false
+	if opt := req.IsEdns0(); opt != nil {
+		do = opt.Do()
+	}
+	cd := req.CheckingDisabled
 	runtime := s.runtime.Load()
 	ctx, cancel := context.WithTimeout(context.Background(), defaultQueryTimeout)
 	defer cancel()
@@ -382,7 +387,7 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 
 	// 2. Cache of real upstream responses.
 	if resp == nil && s.cache != nil {
-		if cached, hit := s.cache.Get(q); hit {
+		if cached, hit := s.cache.Get(q, do, cd); hit {
 			resp = replyFromCached(req, cached)
 			source = "cache"
 			queryErr = nil
@@ -411,7 +416,7 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 					resp = errorReply(req, mdns.RcodeServerFailure)
 				} else if upstreamResp != nil {
 					if s.cache != nil {
-						s.cache.Put(q, upstreamResp)
+						s.cache.Put(q, upstreamResp, do, cd)
 					}
 					resp = replyFromUpstream(req, upstreamResp)
 				}
@@ -426,7 +431,7 @@ func (s *Server) ServeDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 				case hit:
 					resp = localReply(req, records)
 					if s.cache != nil {
-						s.cache.Put(q, resp)
+						s.cache.Put(q, resp, do, cd)
 					}
 				default:
 					resp = errorReply(req, mdns.RcodeNameError)

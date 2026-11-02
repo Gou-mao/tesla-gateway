@@ -73,7 +73,9 @@ func (r *Rewriter) RewriteWithTranslations(msg *mdns.Msg) (*mdns.Msg, []Translat
 // Rewrite returns a rewritten deep copy of msg. A records are translated with
 // the mapping engine, AAAA records are passed through (or dropped), CNAMEs are
 // preserved, and all records keep their original TTL unless ClampTTL is set.
-// OPT records and DNSSEC header flags are left untouched.
+// OPT records are left untouched. DNSSEC signatures are preserved unless an
+// address was actually rewritten, in which case the AD flag is cleared and the
+// now-invalid RRSIGs are removed from the answer and authority sections.
 func Rewrite(msg *mdns.Msg, opts RewriteOptions) *mdns.Msg {
 	out, _ := RewriteWithTranslations(msg, opts)
 	return out
@@ -91,7 +93,33 @@ func RewriteWithTranslations(msg *mdns.Msg, opts RewriteOptions) (*mdns.Msg, []T
 	out.Answer = rewriteRRs(out.Answer, opts, &translations)
 	out.Ns = rewriteRRs(out.Ns, opts, &translations)
 	out.Extra = rewriteRRs(out.Extra, opts, &translations)
+
+	if len(translations) > 0 {
+		// The RRSIGs cover the real addresses, not the mapped ones. Keeping
+		// them (or AD) would make a validating client reject the response.
+		out.AuthenticatedData = false
+		out.Answer = withoutRRSIG(out.Answer)
+		out.Ns = withoutRRSIG(out.Ns)
+	}
 	return out, translations
+}
+
+func withoutRRSIG(rrs []mdns.RR) []mdns.RR {
+	if len(rrs) == 0 {
+		return rrs
+	}
+
+	out := make([]mdns.RR, 0, len(rrs))
+	for _, rr := range rrs {
+		if rr == nil {
+			continue
+		}
+		if rr.Header().Rrtype == mdns.TypeRRSIG {
+			continue
+		}
+		out = append(out, rr)
+	}
+	return out
 }
 
 func rewriteRRs(rrs []mdns.RR, opts RewriteOptions, translations *[]Translation) []mdns.RR {

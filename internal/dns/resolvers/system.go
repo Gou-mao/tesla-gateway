@@ -21,6 +21,8 @@ import (
 
 const (
 	defaultUpstreamTimeout = 5 * time.Second
+	defaultQueryBudget     = 10 * time.Second
+	minUpstreamAttempt     = time.Second
 	defaultDHCPCacheTTL    = 10 * time.Second
 	ubusDumpTimeout        = 3 * time.Second
 
@@ -371,21 +373,42 @@ func (r *SystemResolver) ExchangeMessage(ctx context.Context, req *mdns.Msg) (*m
 		return nil, errors.New("dns: no upstream resolvers configured")
 	}
 
+	// Keep the whole exchange within one budget even when the caller supplies a
+	// longer (or no) deadline. A shorter caller deadline is preserved.
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > defaultQueryBudget {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultQueryBudget)
+		defer cancel()
+	}
+	deadline, _ := ctx.Deadline()
+
 	var errs []error
-	for _, upstream := range upstreams {
+	for i, upstream := range upstreams {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		resp, err := r.exchange(ctx, req, upstream.address, "udp")
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			errs = append(errs, fmt.Errorf("query budget exhausted: %w", context.DeadlineExceeded))
+			break
+		}
+
+		// Divide what is left fairly between this upstream and all later ones,
+		// so an unresponsive server cannot consume the entire budget.
+		attemptTimeout := r.attemptTimeout(remaining, len(upstreams)-i)
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		resp, err := r.exchange(attemptCtx, req, upstream.address, "udp")
 		if err != nil {
+			cancel()
 			errs = append(errs, fmt.Errorf("%s (%s) udp: %w", upstream.display, upstream.source, err))
 			continue
 		}
 
 		if resp.Truncated {
-			tcpResp, tcpErr := r.exchange(ctx, req, upstream.address, "tcp")
+			tcpResp, tcpErr := r.exchange(attemptCtx, req, upstream.address, "tcp")
 			if tcpErr != nil {
+				cancel()
 				errs = append(errs, fmt.Errorf(
 					"%s (%s) tcp after truncation: %w",
 					upstream.display, upstream.source, tcpErr,
@@ -394,6 +417,7 @@ func (r *SystemResolver) ExchangeMessage(ctx context.Context, req *mdns.Msg) (*m
 			}
 			resp = tcpResp
 		}
+		cancel()
 
 		switch resp.Rcode {
 		case mdns.RcodeServerFailure, mdns.RcodeRefused:
@@ -411,6 +435,32 @@ func (r *SystemResolver) ExchangeMessage(ctx context.Context, req *mdns.Msg) (*m
 		return nil, errors.New("dns: no upstream resolvers configured")
 	}
 	return nil, fmt.Errorf("dns: all upstream resolvers failed: %w", errors.Join(errs...))
+}
+
+// attemptTimeout returns the time to give one upstream. It starts from an even
+// share of the remaining query budget, is capped by the configured per-upstream
+// timeout, and keeps a small floor when doing so cannot starve later upstreams.
+func (r *SystemResolver) attemptTimeout(remaining time.Duration, remainingUpstreams int) time.Duration {
+	if remaining <= 0 || remainingUpstreams <= 0 {
+		return remaining
+	}
+
+	timeout := remaining / time.Duration(remainingUpstreams)
+	if r.timeout > 0 && timeout > r.timeout {
+		timeout = r.timeout
+	}
+
+	floor := minUpstreamAttempt
+	if r.timeout > 0 && r.timeout < floor {
+		floor = r.timeout
+	}
+	if timeout < floor && floor*time.Duration(remainingUpstreams) <= remaining {
+		timeout = floor
+	}
+	if timeout <= 0 || timeout > remaining {
+		timeout = remaining
+	}
+	return timeout
 }
 
 func (r *SystemResolver) exchange(ctx context.Context, req *mdns.Msg, upstream, network string) (*mdns.Msg, error) {

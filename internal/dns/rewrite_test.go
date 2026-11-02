@@ -163,7 +163,22 @@ func TestRewriteDropAAAA(t *testing.T) {
 	}
 }
 
-func TestRewritePreservesEDNS0AndDNSSEC(t *testing.T) {
+func rrsigRecord(name string) *mdns.RRSIG {
+	return &mdns.RRSIG{
+		Hdr:         mdns.RR_Header{Name: name, Rrtype: mdns.TypeRRSIG, Class: mdns.ClassINET, Ttl: 600},
+		TypeCovered: mdns.TypeA,
+		Algorithm:   8,
+		Labels:      2,
+		OrigTtl:     600,
+		Expiration:  1700000000,
+		Inception:   1600000000,
+		KeyTag:      12345,
+		SignerName:  "home.",
+		Signature:   "AAAA",
+	}
+}
+
+func TestRewriteClearsDNSSECAfterAddressRewrite(t *testing.T) {
 	msg := new(mdns.Msg)
 	msg.SetQuestion("nas.home.", mdns.TypeA)
 	msg.Response = true
@@ -172,17 +187,33 @@ func TestRewritePreservesEDNS0AndDNSSEC(t *testing.T) {
 	msg.SetEdns0(1232, true)
 	opt := msg.IsEdns0()
 	optTTL := opt.Hdr.Ttl
-	msg.Answer = []mdns.RR{aRecord("nas.home.", "192.168.1.251", 600)}
+	msg.Answer = []mdns.RR{
+		aRecord("nas.home.", "192.168.1.251", 600),
+		rrsigRecord("nas.home."),
+	}
+	msg.Ns = []mdns.RR{rrsigRecord("home.")}
 
-	got := tgdns.Rewrite(msg, tgdns.RewriteOptions{
+	got, translations := tgdns.RewriteWithTranslations(msg, tgdns.RewriteOptions{
 		Engine:   testEngine(t),
 		ClampTTL: 1,
 	})
-	if !got.AuthenticatedData {
-		t.Error("AD flag was cleared")
+	if len(translations) != 1 {
+		t.Fatalf("len(translations) = %d, want 1", len(translations))
+	}
+	if got.AuthenticatedData {
+		t.Error("AD flag was kept after an address rewrite")
 	}
 	if !got.CheckingDisabled {
 		t.Error("CD flag was cleared")
+	}
+	if len(got.Answer) != 1 {
+		t.Fatalf("len(Answer) = %d, want A only after RRSIG removal", len(got.Answer))
+	}
+	if len(got.Ns) != 0 {
+		t.Errorf("len(Ns) = %d, want RRSIG removed", len(got.Ns))
+	}
+	if got.Answer[0].Header().Rrtype == mdns.TypeRRSIG {
+		t.Error("RRSIG remained in the answer section")
 	}
 
 	gotOpt := got.IsEdns0()
@@ -197,6 +228,47 @@ func TestRewritePreservesEDNS0AndDNSSEC(t *testing.T) {
 	}
 	if gotOpt.Hdr.Ttl != optTTL {
 		t.Errorf("OPT TTL/flags = %d, want unchanged %d", gotOpt.Hdr.Ttl, optTTL)
+	}
+	if got.Answer[0].Header().Ttl != 1 {
+		t.Errorf("A TTL = %d, want clamp 1", got.Answer[0].Header().Ttl)
+	}
+	if !msg.AuthenticatedData || len(msg.Answer) != 2 || len(msg.Ns) != 1 {
+		t.Error("input message was mutated")
+	}
+}
+
+func TestRewritePreservesDNSSECWithoutAddressRewrite(t *testing.T) {
+	msg := new(mdns.Msg)
+	msg.SetQuestion("other.home.", mdns.TypeA)
+	msg.Response = true
+	msg.AuthenticatedData = true
+	msg.SetEdns0(1232, true)
+	msg.Answer = []mdns.RR{
+		aRecord("other.home.", "10.0.0.5", 600),
+		rrsigRecord("other.home."),
+	}
+	msg.Ns = []mdns.RR{rrsigRecord("home.")}
+
+	got, translations := tgdns.RewriteWithTranslations(msg, tgdns.RewriteOptions{
+		Engine:   testEngine(t),
+		ClampTTL: 1,
+	})
+	if len(translations) != 0 {
+		t.Fatalf("len(translations) = %d, want 0", len(translations))
+	}
+	if !got.AuthenticatedData {
+		t.Error("AD flag was cleared without an address rewrite")
+	}
+	if len(got.Answer) != 2 || got.Answer[1].Header().Rrtype != mdns.TypeRRSIG {
+		t.Error("answer RRSIG was removed without an address rewrite")
+	}
+	if len(got.Ns) != 1 || got.Ns[0].Header().Rrtype != mdns.TypeRRSIG {
+		t.Error("authority RRSIG was removed without an address rewrite")
+	}
+
+	gotOpt := got.IsEdns0()
+	if gotOpt == nil || !gotOpt.Do() {
+		t.Error("OPT/DO was not preserved")
 	}
 	if got.Answer[0].Header().Ttl != 1 {
 		t.Errorf("A TTL = %d, want clamp 1", got.Answer[0].Header().Ttl)

@@ -37,10 +37,10 @@ func TestCacheTTLExpiryAndUnrewrittenData(t *testing.T) {
 	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
 	q := cacheQuestion("Nas.Home.", mdns.TypeA)
 
-	cache.Put(q, positiveResponse("nas.home.", 2))
+	cache.Put(q, positiveResponse("nas.home.", 2), false, false)
 	now = now.Add(time.Second)
 
-	got, ok := cache.Get(cacheQuestion("nas.home.", mdns.TypeA))
+	got, ok := cache.Get(cacheQuestion("nas.home.", mdns.TypeA), false, false)
 	if !ok {
 		t.Fatal("Get() = miss after 1s, want hit (TTL 2s)")
 	}
@@ -53,7 +53,7 @@ func TestCacheTTLExpiryAndUnrewrittenData(t *testing.T) {
 	}
 
 	now = now.Add(time.Second)
-	if _, ok := cache.Get(q); ok {
+	if _, ok := cache.Get(q, false, false); ok {
 		t.Error("Get() = hit at expiry, want miss")
 	}
 	if cache.Len() != 0 {
@@ -75,10 +75,10 @@ func TestCacheNegativeNXDOMAIN(t *testing.T) {
 		Retry:   600,
 		Expire:  86400,
 	}
-	cache.Put(q, negativeResponse("missing.home.", mdns.RcodeNameError, soa))
+	cache.Put(q, negativeResponse("missing.home.", mdns.RcodeNameError, soa), false, false)
 
 	now = now.Add(4 * time.Second)
-	got, ok := cache.Get(q)
+	got, ok := cache.Get(q, false, false)
 	if !ok {
 		t.Fatal("Get() = miss after 4s, want negative cache hit")
 	}
@@ -90,7 +90,7 @@ func TestCacheNegativeNXDOMAIN(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Second)
-	if _, ok := cache.Get(q); ok {
+	if _, ok := cache.Get(q, false, false); ok {
 		t.Error("Get() = hit after SOA minimum expired, want miss")
 	}
 }
@@ -100,14 +100,14 @@ func TestCacheNegativeNODATADefaultTTL(t *testing.T) {
 	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
 	q := cacheQuestion("empty.home.", mdns.TypeA)
 
-	cache.Put(q, negativeResponse("empty.home.", mdns.RcodeSuccess, nil))
+	cache.Put(q, negativeResponse("empty.home.", mdns.RcodeSuccess, nil), false, false)
 
 	now = now.Add(29 * time.Second)
-	if _, ok := cache.Get(q); !ok {
+	if _, ok := cache.Get(q, false, false); !ok {
 		t.Error("Get() = miss after 29s, want default 30s negative cache hit")
 	}
 	now = now.Add(2 * time.Second)
-	if _, ok := cache.Get(q); ok {
+	if _, ok := cache.Get(q, false, false); ok {
 		t.Error("Get() = hit after default 30s, want miss")
 	}
 }
@@ -116,17 +116,17 @@ func TestCacheLRUEviction(t *testing.T) {
 	now := time.Unix(1000, 0)
 	cache := tgdns.NewCache(2, tgdns.WithCacheClock(func() time.Time { return now }))
 
-	cache.Put(cacheQuestion("one.home.", mdns.TypeA), positiveResponse("one.home.", 60))
-	cache.Put(cacheQuestion("two.home.", mdns.TypeA), positiveResponse("two.home.", 60))
-	cache.Put(cacheQuestion("three.home.", mdns.TypeA), positiveResponse("three.home.", 60))
+	cache.Put(cacheQuestion("one.home.", mdns.TypeA), positiveResponse("one.home.", 60), false, false)
+	cache.Put(cacheQuestion("two.home.", mdns.TypeA), positiveResponse("two.home.", 60), false, false)
+	cache.Put(cacheQuestion("three.home.", mdns.TypeA), positiveResponse("three.home.", 60), false, false)
 
-	if _, ok := cache.Get(cacheQuestion("one.home.", mdns.TypeA)); ok {
+	if _, ok := cache.Get(cacheQuestion("one.home.", mdns.TypeA), false, false); ok {
 		t.Error("oldest entry was not evicted")
 	}
-	if _, ok := cache.Get(cacheQuestion("two.home.", mdns.TypeA)); !ok {
+	if _, ok := cache.Get(cacheQuestion("two.home.", mdns.TypeA), false, false); !ok {
 		t.Error("second entry missing after eviction")
 	}
-	if _, ok := cache.Get(cacheQuestion("three.home.", mdns.TypeA)); !ok {
+	if _, ok := cache.Get(cacheQuestion("three.home.", mdns.TypeA), false, false); !ok {
 		t.Error("newest entry missing")
 	}
 }
@@ -135,12 +135,47 @@ func TestCacheKeyIsCaseInsensitiveAndQTypeSpecific(t *testing.T) {
 	now := time.Unix(1000, 0)
 	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
 
-	cache.Put(cacheQuestion("NAS.Home.", mdns.TypeA), positiveResponse("nas.home.", 60))
-	if _, ok := cache.Get(cacheQuestion("nas.home.", mdns.TypeA)); !ok {
+	cache.Put(cacheQuestion("NAS.Home.", mdns.TypeA), positiveResponse("nas.home.", 60), false, false)
+	if _, ok := cache.Get(cacheQuestion("nas.home.", mdns.TypeA), false, false); !ok {
 		t.Error("case-insensitive A lookup missed")
 	}
-	if _, ok := cache.Get(cacheQuestion("nas.home.", mdns.TypeAAAA)); ok {
+	if _, ok := cache.Get(cacheQuestion("nas.home.", mdns.TypeAAAA), false, false); ok {
 		t.Error("AAAA lookup hit an A cache entry")
+	}
+}
+
+func TestCacheKeyIncludesDOAndCD(t *testing.T) {
+	now := time.Unix(1000, 0)
+	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
+	q := cacheQuestion("flags.home.", mdns.TypeA)
+	msg := positiveResponse("flags.home.", 60)
+
+	cache.Put(q, msg, true, false)
+	if _, ok := cache.Get(q, true, false); !ok {
+		t.Error("DO=1 lookup missed its own entry")
+	}
+	if _, ok := cache.Get(q, false, false); ok {
+		t.Error("DO=0 lookup hit the DO=1 cache entry")
+	}
+	if _, ok := cache.Get(q, true, true); ok {
+		t.Error("CD=1 lookup hit the CD=0 cache entry")
+	}
+
+	cache.Put(q, msg, false, true)
+	if _, ok := cache.Get(q, false, true); !ok {
+		t.Error("CD=1 lookup missed its own entry")
+	}
+	if _, ok := cache.Get(q, true, false); !ok {
+		t.Error("DO=1/CD=0 entry was lost after storing a different flag combination")
+	}
+	if _, ok := cache.Get(q, false, false); ok {
+		t.Error("DO=0/CD=0 lookup hit a different flag combination")
+	}
+	if _, ok := cache.Get(q, true, true); ok {
+		t.Error("DO=1/CD=1 lookup hit a different flag combination")
+	}
+	if got := cache.Len(); got != 2 {
+		t.Errorf("Len() = %d, want 2 flag-specific entries", got)
 	}
 }
 
@@ -148,8 +183,8 @@ func TestCacheSizeCountsOnlyValidEntries(t *testing.T) {
 	now := time.Unix(1000, 0)
 	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
 
-	cache.Put(cacheQuestion("short.home.", mdns.TypeA), positiveResponse("short.home.", 1))
-	cache.Put(cacheQuestion("long.home.", mdns.TypeA), positiveResponse("long.home.", 60))
+	cache.Put(cacheQuestion("short.home.", mdns.TypeA), positiveResponse("short.home.", 1), false, false)
+	cache.Put(cacheQuestion("long.home.", mdns.TypeA), positiveResponse("long.home.", 60), false, false)
 	if got := cache.Size(); got != 2 {
 		t.Errorf("Size() = %d, want 2", got)
 	}
@@ -161,7 +196,7 @@ func TestCacheSizeCountsOnlyValidEntries(t *testing.T) {
 	if got := cache.Len(); got != 1 {
 		t.Errorf("Len() after Size cleanup = %d, want 1", got)
 	}
-	if _, ok := cache.Get(cacheQuestion("long.home.", mdns.TypeA)); !ok {
+	if _, ok := cache.Get(cacheQuestion("long.home.", mdns.TypeA), false, false); !ok {
 		t.Error("valid entry was removed by Size")
 	}
 }
@@ -169,7 +204,7 @@ func TestCacheSizeCountsOnlyValidEntries(t *testing.T) {
 func TestCacheClear(t *testing.T) {
 	now := time.Unix(1000, 0)
 	cache := tgdns.NewCache(10, tgdns.WithCacheClock(func() time.Time { return now }))
-	cache.Put(cacheQuestion("nas.home.", mdns.TypeA), positiveResponse("nas.home.", 60))
+	cache.Put(cacheQuestion("nas.home.", mdns.TypeA), positiveResponse("nas.home.", 60), false, false)
 	cache.Clear()
 	if cache.Len() != 0 {
 		t.Errorf("Len() = %d after Clear, want 0", cache.Len())

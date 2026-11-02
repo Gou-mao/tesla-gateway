@@ -411,3 +411,64 @@ func TestSystemResolverFallsThroughToNextUpstream(t *testing.T) {
 		t.Errorf("second upstream calls = %d, want 1", got)
 	}
 }
+
+func TestSystemResolverBudgetLeavesTimeForThirdUpstream(t *testing.T) {
+	// Bind but never answer, so the first two upstreams deterministically time
+	// out and would consume the whole caller budget under the old behavior.
+	first, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen first silent udp: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+	second, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen second silent udp: %v", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	var thirdCalls atomic.Int32
+	third := startUDPAndTCP(t,
+		mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
+			thirdCalls.Add(1)
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = []mdns.RR{systemARecord(req.Question[0].Name, "192.0.2.3")}
+			_ = w.WriteMsg(resp)
+		}),
+		mdns.HandlerFunc(func(w mdns.ResponseWriter, req *mdns.Msg) {
+			resp := new(mdns.Msg)
+			resp.SetReply(req)
+			resp.Answer = []mdns.RR{systemARecord(req.Question[0].Name, "192.0.2.3")}
+			_ = w.WriteMsg(resp)
+		}),
+	)
+
+	resolver, err := resolvers.NewSystemResolver(
+		[]string{first.LocalAddr().String(), second.LocalAddr().String(), third},
+	)
+	if err != nil {
+		t.Fatalf("NewSystemResolver() = %v", err)
+	}
+
+	const budget = 4 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	start := time.Now()
+	records, hit, err := resolver.Lookup(ctx, mdns.Question{
+		Name: "third.home.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET,
+	})
+	elapsed := time.Since(start)
+	if err != nil || !hit || len(records) != 1 {
+		t.Fatalf("Lookup() = %v, %v, %v; want the third upstream to answer", records, hit, err)
+	}
+	if got := records[0].(*mdns.A).A.String(); got != "192.0.2.3" {
+		t.Errorf("A = %s, want the third upstream response 192.0.2.3", got)
+	}
+	if got := thirdCalls.Load(); got != 1 {
+		t.Errorf("third upstream calls = %d, want 1", got)
+	}
+	if elapsed > budget {
+		t.Errorf("Lookup() took %s, want no more than the %s total budget", elapsed, budget)
+	}
+}

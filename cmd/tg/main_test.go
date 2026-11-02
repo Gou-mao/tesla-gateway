@@ -200,6 +200,68 @@ func TestReplaceUpstreamLineMissingKey(t *testing.T) {
 	}
 }
 
+func TestReplaceUpstreamLineConsumesBlockList(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "LF",
+			input: "# keep this comment\n" +
+				"dns:\n" +
+				"  resolvers: [hosts, system]\n" +
+				"  upstream:\n" +
+				"    - \"dhcp\"\n" +
+				"    - \"1.1.1.1\"\n" +
+				"  hosts_path: \"/etc/hosts\"\n" +
+				"proxy:\n" +
+				"  tcp_listen: \":16464\"\n",
+			want: "# keep this comment\n" +
+				"dns:\n" +
+				"  resolvers: [hosts, system]\n" +
+				"  upstream: [\"8.8.8.8\", \"2001:db8::1\"]\n" +
+				"  hosts_path: \"/etc/hosts\"\n" +
+				"proxy:\n" +
+				"  tcp_listen: \":16464\"\n",
+		},
+		{
+			name: "CRLF",
+			input: "dns:\r\n" +
+				"  upstream:\r\n" +
+				"    - \"dhcp\"\r\n" +
+				"    - \"1.1.1.1\"\r\n" +
+				"proxy:\r\n" +
+				"  tcp_listen: \":16464\"\r\n",
+			want: "dns:\r\n" +
+				"  upstream: [\"8.8.8.8\", \"2001:db8::1\"]\r\n" +
+				"proxy:\r\n" +
+				"  tcp_listen: \":16464\"\r\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := replaceUpstreamLine([]byte(tc.input), []string{"8.8.8.8", "2001:db8::1"})
+			if err != nil {
+				t.Fatalf("replaceUpstreamLine() = %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("replaceUpstreamLine() =\n%s\nwant:\n%s", got, tc.want)
+			}
+
+			cfg, err := config.Parse(got)
+			if err != nil {
+				t.Fatalf("config.Parse(updated) = %v, want valid YAML", err)
+			}
+			wantItems := []string{"8.8.8.8", "2001:db8::1"}
+			if !reflect.DeepEqual(cfg.DNS.Upstream, wantItems) {
+				t.Errorf("parsed dns.upstream = %v, want %v", cfg.DNS.Upstream, wantItems)
+			}
+		})
+	}
+}
+
 func TestUpdateConfigUpstream(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -266,6 +328,37 @@ func TestUpdateConfigUpstreamRejectsInvalidWithoutWriting(t *testing.T) {
 	}
 	if string(got) != input {
 		t.Errorf("config changed after invalid update: %q", got)
+	}
+}
+
+func TestUpdateConfigUpstreamRejectsInvalidUpdatedConfigWithoutWriting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	input := "mapping_strategy: prefix\n" +
+		"mappings:\n" +
+		"  - { from: \"not-a-prefix\", to: \"100.64.1.0/24\" }\n" +
+		"dns:\n" +
+		"  listen: \"0.0.0.0:53\"\n" +
+		"  upstream:\n" +
+		"    - \"old\"\n"
+	if err := os.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() = %v", err)
+	}
+
+	err := updateConfigUpstream(path, "8.8.8.8")
+	if err == nil {
+		t.Fatal("updateConfigUpstream() = nil; want validation error")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Errorf("updateConfigUpstream() error = %q, want invalid configuration", err)
+	}
+
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("os.ReadFile() = %v", readErr)
+	}
+	if string(got) != input {
+		t.Errorf("config changed after invalid updated config: %q", got)
 	}
 }
 
@@ -391,7 +484,7 @@ func TestReloadAppliesDNSUpstreamAndKeepsRewriter(t *testing.T) {
 		Hdr: mdns.RR_Header{Name: cachedQuestion.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 30},
 		A:   net.IPv4(192, 0, 2, 1),
 	}}
-	cache.Put(cachedQuestion, cached)
+	cache.Put(cachedQuestion, cached, false, false)
 
 	if err := reload(configPath, current, server, cache, nil, nil, logger); err != nil {
 		t.Fatalf("reload() = %v, want nil", err)
@@ -399,7 +492,7 @@ func TestReloadAppliesDNSUpstreamAndKeepsRewriter(t *testing.T) {
 	if !reflect.DeepEqual(current.DNS.Upstream, []string{"1.1.1.1"}) {
 		t.Errorf("current.DNS.Upstream = %v, want [1.1.1.1]", current.DNS.Upstream)
 	}
-	if _, hit := cache.Get(cachedQuestion); hit {
+	if _, hit := cache.Get(cachedQuestion, false, false); hit {
 		t.Error("cache still contains the old response after reload")
 	}
 

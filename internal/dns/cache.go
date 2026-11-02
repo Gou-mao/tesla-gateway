@@ -111,8 +111,9 @@ func (c *Cache) Clear() {
 
 // Get returns a deep copy of the cached response. Expired entries are treated
 // as misses. TTLs in the returned copy are reduced by the time spent in the
-// cache.
-func (c *Cache) Get(q mdns.Question) (*mdns.Msg, bool) {
+// cache. do and cd are the request's EDNS0 DNSSEC-OK and CheckingDisabled bits;
+// they are part of the key because they change the upstream response.
+func (c *Cache) Get(q mdns.Question, do, cd bool) (*mdns.Msg, bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -120,7 +121,7 @@ func (c *Cache) Get(q mdns.Question) (*mdns.Msg, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	element, ok := c.items[cacheKey(q)]
+	element, ok := c.items[cacheKey(q, do, cd)]
 	if !ok {
 		return nil, false
 	}
@@ -143,8 +144,9 @@ func (c *Cache) Get(q mdns.Question) (*mdns.Msg, bool) {
 // Put stores a real response if it is cacheable. Positive answers expire after
 // the smallest answer TTL. NXDOMAIN and NODATA responses expire according to
 // the SOA minimum (or 30 seconds when no SOA is present). Other rcodes and
-// zero-TTL responses are not cached. OPT records are not stored.
-func (c *Cache) Put(q mdns.Question, msg *mdns.Msg) {
+// zero-TTL responses are not cached. OPT records are not stored. do and cd
+// distinguish responses obtained with different DNSSEC request flags.
+func (c *Cache) Put(q mdns.Question, msg *mdns.Msg, do, cd bool) {
 	if c == nil || msg == nil {
 		return
 	}
@@ -159,7 +161,7 @@ func (c *Cache) Put(q mdns.Question, msg *mdns.Msg) {
 	stored.Extra = withoutOPT(stored.Extra)
 
 	entry := &cacheEntry{
-		key:    cacheKey(q),
+		key:    cacheKey(q, do, cd),
 		msg:    stored,
 		stored: now,
 		expiry: now.Add(ttl),
@@ -190,9 +192,12 @@ func (c *Cache) removeElement(element *list.Element) {
 	c.lru.Remove(element)
 }
 
-func cacheKey(q mdns.Question) string {
+func cacheKey(q mdns.Question, do, cd bool) string {
 	name := strings.ToLower(mdns.Fqdn(q.Name))
-	return name + "\x00" + strconv.FormatUint(uint64(q.Qtype), 10)
+	return name + "\x00" +
+		strconv.FormatUint(uint64(q.Qtype), 10) + "\x00" +
+		strconv.FormatBool(do) + "\x00" +
+		strconv.FormatBool(cd)
 }
 
 func cacheTTL(msg *mdns.Msg, qtype uint16) (time.Duration, bool) {

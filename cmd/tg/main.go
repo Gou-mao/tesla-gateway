@@ -409,6 +409,21 @@ func updateConfigUpstream(path, raw string) error {
 	if err != nil {
 		return fmt.Errorf("config %s: %w", path, err)
 	}
+
+	// Parse and validate the complete updated document before touching the
+	// file. A malformed replacement (for example a leftover block-list item)
+	// must never be written to disk and then fail the next service start.
+	parsed, err := config.Parse(updated)
+	if err != nil {
+		return fmt.Errorf("config %s: updated configuration is invalid: %w", path, err)
+	}
+	if !reflect.DeepEqual(parsed.DNS.Upstream, items) {
+		return fmt.Errorf(
+			"config %s: updated dns.upstream is %v, want %v",
+			path, parsed.DNS.Upstream, items,
+		)
+	}
+
 	info, err := os.Stat(path)
 	if err != nil {
 		return fmt.Errorf("stat config %s: %w", path, err)
@@ -473,7 +488,9 @@ func parseUpstreamItems(raw string) ([]string, error) {
 
 // replaceUpstreamLine replaces the first active YAML line whose trimmed key is
 // upstream:, preserving the original indentation and line ending. Commented-out
-// lines are ignored.
+// lines are ignored. When the key has no inline value, a following block list is
+// consumed and replaced by the same inline flow list, so no stale "- item" lines
+// remain behind.
 func replaceUpstreamLine(data []byte, items []string) ([]byte, error) {
 	if len(items) == 0 {
 		return nil, fmt.Errorf("upstream list is empty")
@@ -488,24 +505,18 @@ func replaceUpstreamLine(data []byte, items []string) ([]byte, error) {
 	lines := strings.SplitAfter(string(data), "\n")
 	replaced := false
 	for i, line := range lines {
-		body := line
-		ending := ""
-		if strings.HasSuffix(body, "\n") {
-			body = strings.TrimSuffix(body, "\n")
-			ending = "\n"
-			if strings.HasSuffix(body, "\r") {
-				body = strings.TrimSuffix(body, "\r")
-				ending = "\r\n"
-			}
-		}
-
+		body, ending := splitLineEnding(line)
 		trimmed := strings.TrimSpace(body)
 		if strings.HasPrefix(trimmed, "#") || !isUpstreamKeyLine(trimmed) {
 			continue
 		}
 
 		indent := body[:len(body)-len(strings.TrimLeft(body, " \t"))]
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "upstream:"))
 		lines[i] = indent + value + ending
+		if rest == "" || strings.HasPrefix(rest, "#") {
+			lines = consumeUpstreamBlockItems(lines, i, indent)
+		}
 		replaced = true
 		break
 	}
@@ -514,6 +525,54 @@ func replaceUpstreamLine(data []byte, items []string) ([]byte, error) {
 		return nil, fmt.Errorf(`no active "upstream:" line found`)
 	}
 	return []byte(strings.Join(lines, "")), nil
+}
+
+func splitLineEnding(line string) (body, ending string) {
+	body = line
+	if !strings.HasSuffix(body, "\n") {
+		return body, ""
+	}
+	body = strings.TrimSuffix(body, "\n")
+	ending = "\n"
+	if strings.HasSuffix(body, "\r") {
+		body = strings.TrimSuffix(body, "\r")
+		ending = "\r\n"
+	}
+	return body, ending
+}
+
+// consumeUpstreamBlockItems removes the block-list entries that belong to the
+// upstream key at keyIndex. Only entries indented deeper than the key and
+// starting with "- " are removed; comments and blank lines are left untouched.
+// The scan stops at the first line that cannot be part of that block.
+func consumeUpstreamBlockItems(lines []string, keyIndex int, keyIndent string) []string {
+	keyWidth := indentationWidth(keyIndent)
+	for i := keyIndex + 1; i < len(lines); i++ {
+		body, _ := splitLineEnding(lines[i])
+		trimmed := strings.TrimSpace(body)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		indent := body[:len(body)-len(strings.TrimLeft(body, " \t"))]
+		if indentationWidth(indent) <= keyWidth || !strings.HasPrefix(trimmed, "- ") {
+			break
+		}
+		lines[i] = ""
+	}
+	return lines
+}
+
+func indentationWidth(indent string) int {
+	width := 0
+	for _, char := range indent {
+		if char == '\t' {
+			width += 8
+			continue
+		}
+		width++
+	}
+	return width
 }
 
 func isUpstreamKeyLine(trimmed string) bool {
