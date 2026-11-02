@@ -8,9 +8,7 @@
 				"/tmp/run/tesla-gateway/stats.json": [ "read" ],
 				"/tmp/tesla-gateway/stats.json": [ "read" ],
 				"/etc/tesla-gateway/config.yaml": [ "read" ],
-				"/etc/init.d/tesla-gateway": [ "exec" ],
-				"/usr/sbin/tesla-gateway": [ "exec" ],
-				"/usr/sbin/nft": [ "exec" ]
+				"/usr/libexec/tg-nft-status": [ "exec" ]
 			},
 			"ubus": {
 				"service": [ "list" ]

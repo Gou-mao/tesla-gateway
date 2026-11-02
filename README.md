@@ -47,6 +47,7 @@ tesla-gateway/
 ├── files/etc/tesla-gateway/config.yaml # UFI003 样例配置
 ├── files/usr/share/luci/menu.d/luci-app-tesla-gateway.json   # LuCI 菜单
 ├── files/usr/share/rpcd/acl.d/luci-app-tesla-gateway.json    # LuCI ACL
+├── files/usr/libexec/tg-nft-status     # 只读 nft 状态 wrapper（给 LuCI ACL）
 ├── files/www/luci-static/resources/view/tesla-gateway/overview.js # LuCI 页面
 ├── files/usr/libexec/ts-addr-sync.sh   # Tailscale 共存：动态补 tun 地址 + 100.64/10 路由
 ├── scripts/install-tailscale-coexist.sh # Tailscale 共存设备部署脚本
@@ -202,8 +203,10 @@ DHCP 仍由 dnsmasq 提供；确保 DHCP option 6（DNS 服务器）指向网关
 chmod +x /etc/init.d/tesla-gateway && /etc/init.d/tesla-gateway enable && /etc/init.d/tesla-gateway start
 ```
 
-`reload` 会向进程发送 SIGHUP，仅热加载 DNS 配置；监听地址、代理参数、映射和 nft 变更
-需要重启服务：
+`reload` 会向进程发送 SIGHUP，仅热加载 DNS 解析相关配置（`resolvers`、`upstream`、
+`clamp_ttl`、`drop_aaaa`、`hosts_path`、`lease_path`）。如果检测到映射、
+`dns.listen`、`dns.cache_max`、`stats_path`、代理或 nft 相关字段变化，reload
+会被拒绝并保持旧配置不变；这些字段需要重启服务：
 
 ```sh
 /etc/init.d/tesla-gateway reload
@@ -333,20 +336,18 @@ ACL 说明：
   option 3 / 6；如果移除，DHCP 区块会显示权限不足或默认值。
 - `fs.read` / `fs.write` 由 rpcd 的 `file` 对象按 ACL 里的**真实文件路径**检查。
   `fs.exec` 不是给 `ubus.file` 授权，而是给要执行的**可执行文件路径**加
-  `"exec"`，例如：
-  `"/etc/init.d/tesla-gateway": [ "exec" ]`、`"/usr/sbin/nft": [ "exec" ]`、
-  `"/usr/sbin/tesla-gateway": [ "exec" ]`。
-  本项目的 read 段放行 init.d / nft / tesla-gateway 的 exec，write 段再次
-  放行 init.d 和 tesla-gateway 的 exec，以覆盖「查看状态」「启动 / 停止 /
-  重启」以及「保存 DNS 上游顺序」几类调用。
+  `"exec"`，例如 `"/usr/libexec/tg-nft-status": [ "exec" ]`。
+- read 段只允许读取 `stats.json` 和 `config.yaml`，并通过固定命令的
+  `/usr/libexec/tg-nft-status` 查询 nft 表状态；该 wrapper 忽略参数，只执行
+  `nft list table ip teslagateway`。服务运行状态通过 `ubus service list`
+  （read 段的 `service/list`）读取，不再依赖 init.d 的 `status`。
+- write 段保留 `config.yaml` 的 `write` 以及 init.d / tesla-gateway 的 `exec`，
+  用于启动、停止、重启、保存配置和修改 DNS 上游。只读 ACL 用户点击这些按钮会
+  因缺少 write 权限而失败，但无法借此停止服务或修改防火墙。
 - OpenWrt 的 `/var` 通常指向 `/tmp`，较新的 rpcd 会先 `realpath()` 再复检
   ACL 目标路径。因此 ACL 同时列出 `/var/run/tesla-gateway/stats.json`、
   `/tmp/run/tesla-gateway/stats.json` 和 `/tmp/tesla-gateway/stats.json`；
   设备上只会命中实际存在的那一个，多列不影响安全。
-- 只读 ACL 用户也拥有 init.d 的 `exec` 后，就能执行该脚本的
-  start/stop/restart（`exec` 权限无法按参数细分）。如果要做严格的只读委派，
-  应把 init.d 的 `exec` 只保留在 write 段；此时页面仍可读统计，但运行状态会
-  显示为「未知」。
 - 修改 menu 或 ACL 后必须清缓存并重启 rpcd；只改 view 通常刷新浏览器即可。
 
 若页面菜单不出现或按钮报权限错误，检查：

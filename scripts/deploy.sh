@@ -23,13 +23,14 @@ if [ ! -f "$BIN" ]; then
 	echo "missing $BIN; run 'make build-arm64' first" >&2
 	exit 1
 fi
-if [ ! -f files/etc/init.d/tesla-gateway ] || [ ! -f files/etc/tesla-gateway/config.yaml ]; then
-	echo "missing files/etc deliverables" >&2
+if [ ! -f files/etc/init.d/tesla-gateway ] || [ ! -f files/etc/tesla-gateway/config.yaml ] ||
+   [ ! -f files/usr/libexec/tg-nft-status ]; then
+	echo "missing files deliverables" >&2
 	exit 1
 fi
 
 echo "deploying to $HOST"
-ssh "$HOST" 'mkdir -p /etc/tesla-gateway'
+ssh "$HOST" 'mkdir -p /etc/tesla-gateway /usr/libexec'
 
 # shellcheck disable=SC2086
 scp $SCP_OPTS "$BIN" "$HOST:/usr/sbin/tesla-gateway"
@@ -37,9 +38,11 @@ scp $SCP_OPTS "$BIN" "$HOST:/usr/sbin/tesla-gateway"
 scp $SCP_OPTS files/etc/init.d/tesla-gateway "$HOST:/etc/init.d/tesla-gateway"
 # shellcheck disable=SC2086
 scp $SCP_OPTS files/etc/tesla-gateway/config.yaml "$HOST:/etc/tesla-gateway/config.yaml"
+# shellcheck disable=SC2086
+scp $SCP_OPTS files/usr/libexec/tg-nft-status "$HOST:/usr/libexec/tg-nft-status"
 
 ssh "$HOST" '
-	chmod 0755 /usr/sbin/tesla-gateway /etc/init.d/tesla-gateway
+	chmod 0755 /usr/sbin/tesla-gateway /etc/init.d/tesla-gateway /usr/libexec/tg-nft-status
 	chmod 0644 /etc/tesla-gateway/config.yaml
 	/etc/init.d/tesla-gateway enable
 '

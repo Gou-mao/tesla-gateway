@@ -35,8 +35,25 @@ sleep 9
 tailscale set --netfilter-mode=off 2>/dev/null || true
 
 # 4) firewall: tailscale0 -> wan zone (masq + lan->wan forward)
-have=$(uci get firewall.@zone[1].device 2>/dev/null | tr ' ' '\n' | grep -cx tailscale0)
-[ "$have" = "1" ] || { uci add_list firewall.@zone[1].device='tailscale0'; uci commit firewall; }
+# Find the zone section named "wan" instead of assuming it is @zone[1].
+wan_section=
+while IFS= read -r entry; do
+  section=${entry#firewall.}
+  section=${section%=zone}
+  if [ "$(uci get "firewall.$section.name" 2>/dev/null || true)" = "wan" ]; then
+    wan_section=$section
+    break
+  fi
+done <<EOF
+$(uci show firewall 2>/dev/null | grep '=zone$' || true)
+EOF
+if [ -z "$wan_section" ]; then
+  echo "error: no firewall zone named 'wan' found" >&2
+  exit 1
+fi
+
+have=$(uci get "firewall.$wan_section.device" 2>/dev/null | tr ' ' '\n' | grep -cx tailscale0 || true)
+[ "$have" = "1" ] || { uci add_list "firewall.$wan_section.device=tailscale0"; uci commit firewall; }
 /etc/init.d/firewall reload 2>/dev/null || true
 
 # 5) apply now

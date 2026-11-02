@@ -1,0 +1,7 @@
+#!/bin/sh
+# Read-only nft status helper for LuCI.
+#
+# The ACL grants read-only users exec access to this fixed script instead of
+# /usr/sbin/nft, so they cannot list or modify arbitrary firewall tables.
+# Arguments are deliberately ignored.
+exec /usr/sbin/nft list table ip teslagateway 2>&1

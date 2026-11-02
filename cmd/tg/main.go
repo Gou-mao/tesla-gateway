@@ -663,6 +663,14 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 		return err
 	}
 
+	if changes := restartRequiredChanges(current, next); len(changes) > 0 {
+		logger.Warn("configuration reload rejected; restart is required", logx.Fields{
+			"config":         path,
+			"changed_fields": changes,
+		})
+		return fmt.Errorf("reload rejected: %s changed; restart tesla-gateway to apply", strings.Join(changes, ", "))
+	}
+
 	engine := mapping.NewEngine(next.Strategy)
 	if err := engine.Validate(); err != nil {
 		return err
@@ -673,65 +681,6 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 		runtime, err = buildDNSRuntime(next, engine, logger)
 		if err != nil {
 			return err
-		}
-	}
-
-	if next.DNS.Listen != current.DNS.Listen {
-		logger.Warn("dns.listen changed; restart is required to move the listener", logx.Fields{
-			"old": current.DNS.Listen,
-			"new": next.DNS.Listen,
-		})
-	}
-	if next.DNS.CacheMax != current.DNS.CacheMax {
-		logger.Warn("dns.cache_max changed; restart is required to resize the cache", logx.Fields{
-			"old": current.DNS.CacheMax,
-			"new": next.DNS.CacheMax,
-		})
-	}
-	if next.StatsPath != current.StatsPath {
-		logger.Warn("stats_path changed; restart is required to move the stats file", logx.Fields{
-			"old": current.StatsPath,
-			"new": next.StatsPath,
-		})
-	}
-
-	// TCP proxy listeners and mapping engines are intentionally not rebuilt on
-	// SIGHUP. DNS reloads in place; proxy changes require a restart.
-	if tcpProxy != nil {
-		if next.Proxy.TCPListen != current.Proxy.TCPListen {
-			logger.Warn("proxy.tcp_listen changed; restart is required to move the listener", logx.Fields{
-				"old": current.Proxy.TCPListen,
-				"new": next.Proxy.TCPListen,
-			})
-		}
-		if next.Proxy.Mode != current.Proxy.Mode ||
-			next.Proxy.KeepAlive != current.Proxy.KeepAlive ||
-			next.Proxy.MaxConns != current.Proxy.MaxConns ||
-			next.Proxy.IdleTimeout != current.Proxy.IdleTimeout {
-			logger.Warn("proxy settings changed; restart is required to apply them", logx.Fields{
-				"old_mode":         current.Proxy.Mode,
-				"new_mode":         next.Proxy.Mode,
-				"old_keepalive":    current.Proxy.KeepAlive.String(),
-				"new_keepalive":    next.Proxy.KeepAlive.String(),
-				"old_max_conns":    current.Proxy.MaxConns,
-				"new_max_conns":    next.Proxy.MaxConns,
-				"old_idle_timeout": current.Proxy.IdleTimeout.String(),
-				"new_idle_timeout": next.Proxy.IdleTimeout.String(),
-			})
-		}
-		if next.MappingStrategy != current.MappingStrategy ||
-			!reflect.DeepEqual(next.Mappings, current.Mappings) ||
-			!reflect.DeepEqual(next.RealPrefixes, current.RealPrefixes) {
-			logger.Warn("mapping rules changed; the TCP proxy keeps its startup mapping until restart", nil)
-		}
-		if next.Proxy.ApplyNft != current.Proxy.ApplyNft ||
-			next.Proxy.LocalClientPrefix != current.Proxy.LocalClientPrefix {
-			logger.Warn("nft settings changed; restart is required to reapply nft rules", logx.Fields{
-				"old_apply_nft":           current.Proxy.ApplyNft,
-				"new_apply_nft":           next.Proxy.ApplyNft,
-				"old_local_client_prefix": current.Proxy.LocalClientPrefix,
-				"new_local_client_prefix": next.Proxy.LocalClientPrefix,
-			})
 		}
 	}
 
@@ -754,4 +703,54 @@ func reload(path string, current *config.Config, server *tgdns.Server, cache *tg
 		"drop_aaaa": current.DNS.DropAAAA,
 	})
 	return nil
+}
+
+// restartRequiredChanges lists configuration fields that cannot be applied
+// safely in place. A SIGHUP reload must be rejected when any of them changes:
+// applying only part of the configuration would leave DNS, the TCP proxy, and
+// nft using different mappings or listener settings.
+func restartRequiredChanges(current, next *config.Config) []string {
+	var changes []string
+
+	if next.MappingStrategy != current.MappingStrategy {
+		changes = append(changes, "mapping_strategy")
+	}
+	if !reflect.DeepEqual(next.Mappings, current.Mappings) {
+		changes = append(changes, "mappings")
+	}
+	if !reflect.DeepEqual(next.RealPrefixes, current.RealPrefixes) {
+		changes = append(changes, "real_prefixes")
+	}
+	if next.Proxy.Mode != current.Proxy.Mode {
+		changes = append(changes, "proxy.mode")
+	}
+	if next.Proxy.TCPListen != current.Proxy.TCPListen {
+		changes = append(changes, "proxy.tcp_listen")
+	}
+	if next.Proxy.KeepAlive != current.Proxy.KeepAlive {
+		changes = append(changes, "proxy.keepalive")
+	}
+	if next.Proxy.MaxConns != current.Proxy.MaxConns {
+		changes = append(changes, "proxy.max_conns")
+	}
+	if next.Proxy.IdleTimeout != current.Proxy.IdleTimeout {
+		changes = append(changes, "proxy.idle_timeout")
+	}
+	if next.Proxy.ApplyNft != current.Proxy.ApplyNft {
+		changes = append(changes, "proxy.apply_nft")
+	}
+	if next.Proxy.LocalClientPrefix != current.Proxy.LocalClientPrefix {
+		changes = append(changes, "proxy.local_client_prefix")
+	}
+	if next.DNS.Listen != current.DNS.Listen {
+		changes = append(changes, "dns.listen")
+	}
+	if next.DNS.CacheMax != current.DNS.CacheMax {
+		changes = append(changes, "dns.cache_max")
+	}
+	if next.StatsPath != current.StatsPath {
+		changes = append(changes, "stats_path")
+	}
+
+	return changes
 }

@@ -4,13 +4,21 @@
 'require fs';
 'require ui';
 'require poll';
+'require rpc';
 'require uci';
 
 var INIT = '/etc/init.d/tesla-gateway';
 var CONFIG = '/etc/tesla-gateway/config.yaml';
 var STATS = '/var/run/tesla-gateway/stats.json';
-var NFT = '/usr/sbin/nft';
+var NFT_STATUS = '/usr/libexec/tg-nft-status';
 var TG_BIN = '/usr/sbin/tesla-gateway';
+
+var callServiceList = rpc.declare({
+	object: 'service',
+	method: 'list',
+	params: [ 'name' ],
+	expect: { '': {} }
+});
 
 function readStats() {
 	return L.resolveDefault(fs.read(STATS), null).then(function(raw) {
@@ -457,24 +465,41 @@ function formatStrategy(value) {
 	return String(value);
 }
 
-function getServiceState(result) {
-	if (!result)
+function getServiceState(serviceList) {
+	if (!serviceList || typeof serviceList !== 'object')
 		return { running: null, text: _('未知') };
 
-	var out = String(result.stdout || '') + '\n' + String(result.stderr || '');
-	out = out.trim();
+	var service = Object.prototype.hasOwnProperty.call(serviceList, 'tesla-gateway')
+		? serviceList['tesla-gateway']
+		: null;
 
-	/* procd/rc.common prints "not running" when the service is stopped. */
-	if (/\bnot\s+running\b/i.test(out))
+	if (!service)
 		return { running: false, text: _('已停止') };
 
-	if (/\brunning\b/i.test(out))
-		return { running: true, text: _('运行中') };
+	var instances = service.instances;
 
-	return {
-		running: result.code === 0,
-		text: result.code === 0 ? _('运行中') : _('已停止')
-	};
+	if (!instances || typeof instances !== 'object')
+		return { running: null, text: _('未知') };
+
+	var names = Object.keys(instances);
+	var known = false;
+
+	for (var i = 0; i < names.length; i++) {
+		var instance = instances[names[i]];
+
+		if (!instance || typeof instance.running !== 'boolean')
+			continue;
+
+		known = true;
+
+		if (instance.running)
+			return { running: true, text: _('运行中') };
+	}
+
+	if (known || names.length === 0)
+		return { running: false, text: _('已停止') };
+
+	return { running: null, text: _('未知') };
 }
 
 function getNftState(result) {
@@ -525,9 +550,9 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			readStats(),
-			L.resolveDefault(fs.exec(INIT, [ 'status' ]), null),
+			L.resolveDefault(callServiceList('tesla-gateway'), null),
 			L.resolveDefault(fs.read(CONFIG), null),
-			L.resolveDefault(fs.exec(NFT, [ 'list', 'table', 'ip', 'teslagateway' ]), null),
+			L.resolveDefault(fs.exec(NFT_STATUS, []), null),
 			loadUCI()
 		]);
 	},
@@ -1171,8 +1196,8 @@ return view.extend({
 
 			return Promise.all([
 				readStats(),
-				L.resolveDefault(fs.exec(INIT, [ 'status' ]), null),
-				L.resolveDefault(fs.exec(NFT, [ 'list', 'table', 'ip', 'teslagateway' ]), null)
+				L.resolveDefault(callServiceList('tesla-gateway'), null),
+				L.resolveDefault(fs.exec(NFT_STATUS, []), null)
 			]).then(function(result) {
 				if (root && document.body.contains(root))
 					applyLive(result[0], result[1], result[2]);

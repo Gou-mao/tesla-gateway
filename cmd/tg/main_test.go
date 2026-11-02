@@ -1,12 +1,21 @@
 package main
 
 import (
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
+	mdns "github.com/miekg/dns"
+
 	"tesla-gateway/internal/config"
+	tgdns "tesla-gateway/internal/dns"
+	"tesla-gateway/internal/logx"
+	"tesla-gateway/internal/mapping"
 	"tesla-gateway/internal/stats"
 )
 
@@ -257,5 +266,189 @@ func TestUpdateConfigUpstreamRejectsInvalidWithoutWriting(t *testing.T) {
 	}
 	if string(got) != input {
 		t.Errorf("config changed after invalid update: %q", got)
+	}
+}
+
+type captureResponseWriter struct {
+	msg *mdns.Msg
+}
+
+func (w *captureResponseWriter) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 53}
+}
+
+func (w *captureResponseWriter) RemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+}
+
+func (w *captureResponseWriter) WriteMsg(msg *mdns.Msg) error {
+	w.msg = msg.Copy()
+	return nil
+}
+
+func (w *captureResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *captureResponseWriter) Close() error                { return nil }
+func (w *captureResponseWriter) TsigStatus() error           { return nil }
+func (w *captureResponseWriter) TsigTimersOnly(bool)         {}
+func (w *captureResponseWriter) Hijack()                     {}
+
+func writeReloadConfig(t *testing.T, path, hostsPath, mapTo, upstream string) {
+	t.Helper()
+
+	text := fmt.Sprintf(`mapping_strategy: prefix
+mappings:
+  - { from: "192.168.1.0/24", to: %q }
+dns:
+  listen: "127.0.0.1:0"
+  resolvers: [hosts, system]
+  hosts_path: %q
+  upstream: [%q]
+  clamp_ttl: 30
+`, mapTo, hostsPath, upstream)
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(%s) = %v", path, err)
+	}
+}
+
+func newReloadTestServer(t *testing.T, cfg *config.Config, logger *logx.Logger) (*tgdns.Server, *tgdns.Cache) {
+	t.Helper()
+
+	engine := mapping.NewEngine(cfg.Strategy)
+	runtime, err := buildDNSRuntime(cfg, engine, logger)
+	if err != nil {
+		t.Fatalf("buildDNSRuntime() = %v", err)
+	}
+	cache := tgdns.NewCache(8)
+	server, err := tgdns.NewServer(tgdns.ServerConfig{
+		Listen:   cfg.DNS.Listen,
+		Local:    runtime.local,
+		Upstream: runtime.upstream,
+		Cache:    cache,
+		Rewriter: runtime.rewriter,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatalf("tgdns.NewServer() = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	return server, cache
+}
+
+func queryMappedA(t *testing.T, server *tgdns.Server) *mdns.A {
+	t.Helper()
+
+	request := new(mdns.Msg)
+	request.SetQuestion("nas.home.", mdns.TypeA)
+
+	writer := &captureResponseWriter{}
+	server.ServeDNS(writer, request)
+	if writer.msg == nil {
+		t.Fatal("ServeDNS() did not write a response")
+	}
+	if len(writer.msg.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1: %v", len(writer.msg.Answer), writer.msg.Answer)
+	}
+	record, ok := writer.msg.Answer[0].(*mdns.A)
+	if !ok {
+		t.Fatalf("answer = %T, want *dns.A", writer.msg.Answer[0])
+	}
+	return record
+}
+
+func TestReloadAppliesDNSUpstreamAndKeepsRewriter(t *testing.T) {
+	dir := t.TempDir()
+	hostsPath := filepath.Join(dir, "hosts")
+	configPath := filepath.Join(dir, "config.yaml")
+
+	if err := os.WriteFile(hostsPath, []byte("192.168.1.251 nas.home\n"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(hosts) = %v", err)
+	}
+	writeReloadConfig(t, configPath, hostsPath, "100.64.1.0/24", "8.8.8.8")
+
+	current, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load() = %v", err)
+	}
+	logger, err := logx.New(logx.Config{Output: io.Discard, Module: "test"})
+	if err != nil {
+		t.Fatalf("logx.New() = %v", err)
+	}
+	server, cache := newReloadTestServer(t, current, logger)
+
+	record := queryMappedA(t, server)
+	if record.A.String() != "100.64.1.251" || record.Hdr.Ttl != 30 {
+		t.Fatalf("before reload A = %s TTL %d, want 100.64.1.251 TTL 30", record.A, record.Hdr.Ttl)
+	}
+
+	// Only dns.upstream changes; this is safe to apply in place.
+	writeReloadConfig(t, configPath, hostsPath, "100.64.1.0/24", "1.1.1.1")
+
+	cachedQuestion := mdns.Question{Name: "cached.home.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET}
+	cached := new(mdns.Msg)
+	cached.SetQuestion(cachedQuestion.Name, cachedQuestion.Qtype)
+	cached.Response = true
+	cached.Answer = []mdns.RR{&mdns.A{
+		Hdr: mdns.RR_Header{Name: cachedQuestion.Name, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 30},
+		A:   net.IPv4(192, 0, 2, 1),
+	}}
+	cache.Put(cachedQuestion, cached)
+
+	if err := reload(configPath, current, server, cache, nil, nil, logger); err != nil {
+		t.Fatalf("reload() = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(current.DNS.Upstream, []string{"1.1.1.1"}) {
+		t.Errorf("current.DNS.Upstream = %v, want [1.1.1.1]", current.DNS.Upstream)
+	}
+	if _, hit := cache.Get(cachedQuestion); hit {
+		t.Error("cache still contains the old response after reload")
+	}
+
+	record = queryMappedA(t, server)
+	if record.A.String() != "100.64.1.251" {
+		t.Errorf("after reload A = %s, want rewriter mapping 100.64.1.251", record.A)
+	}
+	if record.Hdr.Ttl != 30 {
+		t.Errorf("after reload TTL = %d, want rewriter clamp 30", record.Hdr.Ttl)
+	}
+}
+
+func TestReloadRejectsMappingChangeAndKeepsOldRuntime(t *testing.T) {
+	dir := t.TempDir()
+	hostsPath := filepath.Join(dir, "hosts")
+	configPath := filepath.Join(dir, "config.yaml")
+
+	if err := os.WriteFile(hostsPath, []byte("192.168.1.251 nas.home\n"), 0o600); err != nil {
+		t.Fatalf("os.WriteFile(hosts) = %v", err)
+	}
+	writeReloadConfig(t, configPath, hostsPath, "100.64.1.0/24", "8.8.8.8")
+
+	current, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load() = %v", err)
+	}
+	logger, err := logx.New(logx.Config{Output: io.Discard, Module: "test"})
+	if err != nil {
+		t.Fatalf("logx.New() = %v", err)
+	}
+	server, cache := newReloadTestServer(t, current, logger)
+	before := *current
+
+	// Mapping changes affect DNS, the TCP proxy, and nft together, so a
+	// SIGHUP reload must be rejected instead of applying only the DNS half.
+	writeReloadConfig(t, configPath, hostsPath, "100.64.2.0/24", "8.8.8.8")
+	err = reload(configPath, current, server, cache, nil, nil, logger)
+	if err == nil {
+		t.Fatal("reload() = nil, want error for changed mappings")
+	}
+	if !strings.Contains(err.Error(), "mappings") || !strings.Contains(err.Error(), "restart") {
+		t.Errorf("reload() error = %q, want mappings and restart", err)
+	}
+	if !reflect.DeepEqual(before, *current) {
+		t.Errorf("current config changed after rejected reload:\nbefore %+v\nafter  %+v", before, *current)
+	}
+
+	record := queryMappedA(t, server)
+	if record.A.String() != "100.64.1.251" {
+		t.Errorf("after rejected reload A = %s, want old mapping 100.64.1.251", record.A)
 	}
 }
