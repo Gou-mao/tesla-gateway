@@ -8,12 +8,18 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    env:
+      GOPROXY: https://goproxy.cn,https://proxy.golang.org,direct
     steps:
-      - uses: actions/checkout@v4
+      # 便携 checkout：不依赖 marketplace action，GitHub 与自建 Gitea runner 通用
+      - name: checkout
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          git clone --depth 1 --branch "$REF" "${{ github.server_url }}/${{ github.repository }}.git" .
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
+      - name: go version
+        run: go version
 
       - name: vet
         run: go vet ./...
