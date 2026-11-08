@@ -13,24 +13,39 @@
 #   fw_mode 可选项只有 iptables / nftables（写 off/noop 会让 tailscaled 起不来
 #   或回退找 iptables 而失败），所以只能在服务起来后用 CLI 改 pref + 清表。
 #
-# 本脚本：等 tailscaled 就绪 → set --netfilter-mode=off → 清残留表 →
-#         ts-addr-sync.sh 补 tailscale0 地址与 100.64.0.0/10 路由。
+# 本脚本：等 tailscaled 就绪 → set --netfilter-mode=off（带验证重试）→
+#         清残留表 → ts-addr-sync.sh 补 tailscale0 地址与 100.64.0.0/10 路由。
 
 START=99
 STOP=10
 
+antispoof_count() {
+	nft list ruleset 2>/dev/null | grep -c 'saddr 100.64'
+}
+
 start() {
 	(
-		for i in $(seq 1 45); do
+		# 1) 等 tailscaled 可响应（最多 ~120s）
+		for i in $(seq 1 60); do
 			tailscale status >/dev/null 2>&1 && break
 			sleep 2
 		done
-		tailscale set --netfilter-mode=off >/dev/null 2>&1
-		sleep 2
-		for t in "ip filter" "ip6 filter" "ip nat" "ip6 nat" "ip mangle" "ip6 mangle"; do
-			nft list table $t >/dev/null 2>&1 && nft delete table $t >/dev/null 2>&1
+
+		# 2) 关 netfilter，验证反欺骗规则归零，不干净就重试
+		for i in $(seq 1 10); do
+			[ "$(antispoof_count)" = "0" ] && break
+			tailscale set --netfilter-mode=off >/dev/null 2>&1
+			sleep 3
+			for t in "ip filter" "ip6 filter" "ip nat" "ip6 nat" "ip mangle" "ip6 mangle"; do
+				nft list table $t >/dev/null 2>&1 && nft delete table $t >/dev/null 2>&1
+			done
 		done
+
+		# 3) 补地址/路由
 		/usr/libexec/ts-addr-sync.sh >/dev/null 2>&1
+
+		# 4) 记一笔结果，便于事后核对开机行为
+		logger -t ts-coexist "boot reconcile done: anti=$(antispoof_count) addr=$(ip -4 addr show tailscale0 2>/dev/null | awk '/inet /{print $2}')"
 	) >/dev/null 2>&1 &
 }
 
