@@ -38,4 +38,21 @@ done
 
 # one broad route covers every tailnet peer; LAN 100.64.0.0/24 stays more specific
 ip route replace 100.64.0.0/10 dev tailscale0 2>/dev/null
+
+# --- netfilter self-heal -------------------------------------------------
+# The OpenWrt tailscale init always starts the daemon with
+# TS_DEBUG_FIREWALL_MODE from uci fw_mode (nftables), and prefs are not
+# persisted, so after every reboot (and on some daemon reconfigurations)
+# tailscaled re-installs its anti-spoof rule
+#   iifname != "tailscale0*" ip saddr 100.64.0.0/10 drop
+# which kills the whole 100.64.0.0/24 LAN (Tesla loses DNS/internet).
+# If we see it, force netfilter off and drop the leftover tables.
+if nft list ruleset 2>/dev/null | grep -q 'saddr 100\.64\.0\.0/10.*drop'; then
+  $TB set --netfilter-mode=off >/dev/null 2>&1
+  for t in "ip filter" "ip6 filter" "ip nat" "ip6 nat" "ip mangle" "ip6 mangle"; do
+    nft list table $t >/dev/null 2>&1 && nft delete table $t >/dev/null 2>&1
+  done
+  logger -t ts-addr-sync "re-removed tailscale anti-spoof for 100.64/10"
+fi
+
 exit 0
