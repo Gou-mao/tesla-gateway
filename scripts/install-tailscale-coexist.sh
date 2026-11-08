@@ -34,6 +34,18 @@ uci set tailscale.settings.enabled='1'; uci commit tailscale
 sleep 9
 tailscale set --netfilter-mode=off 2>/dev/null || true
 
+# 3b) boot hook: prefs 不持久化，重启后 netfilter 会回到 on（见 files/etc/init.d/ts-coexist）
+if [ -f "$DIR/../files/etc/init.d/ts-coexist" ]; then
+  cp "$DIR/../files/etc/init.d/ts-coexist" /etc/init.d/ts-coexist
+elif [ -f "$DIR/ts-coexist" ]; then
+  cp "$DIR/ts-coexist" /etc/init.d/ts-coexist
+fi
+if [ -f /etc/init.d/ts-coexist ]; then
+  chmod 0755 /etc/init.d/ts-coexist
+  /etc/init.d/ts-coexist enable 2>/dev/null || true
+  /etc/init.d/ts-coexist start 2>/dev/null || true
+fi
+
 # 4) firewall: tailscale0 -> wan zone (masq + lan->wan forward)
 # Find the zone section named "wan" instead of assuming it is @zone[1].
 wan_section=

@@ -50,7 +50,31 @@
 - `tailscale0 = 100.78.25.13/32`，`100.64.0.0/10 dev tailscale0` 在；LAN `/24` 在
 - `nft ... 100.64.0.0/10` 计数 = 0（无反欺骗）
 - 设备 → tailnet peer：ICMP + **TCP 均通**（`wget http://<peer>:8099/` → `TESLA_GATEWAY_E2E_OK`）
-- **重启后自动恢复**：daemon 自启 → 连上 → cron 自动补地址/路由，网关/DNS 正常
+- 重启后：由 `/etc/init.d/ts-coexist` 开机钩子自动恢复（见下节"二次重启回归"）
+
+## 二次重启回归（2026-11-08，实测踩坑）
+
+**现象**：设备重启后一切"看起来正常"（tailscale 在线、Tesla Gateway running、设备自己能上外网），
+但 **AP 下所有客户端断网**——Tesla 车端直接提示"未连接到互联网"拒绝使用，`nslookup @100.64.0.1` 超时。
+
+**根因链**：
+1. OpenWrt 的 `/etc/init.d/tailscale` 每次启动都用
+   `TS_DEBUG_FIREWALL_MODE="<uci tailscale.settings.fw_mode>"`（默认 `nftables`）拉起 tailscaled；
+2. `prefs.NetfilterMode` **不随 `tailscaled.state` 持久化** → 重启后回到 `2`（on）；
+3. 于是 tailscaled 重建反欺骗规则
+   `iifname != "tailscale0*" ip saddr 100.64.0.0/10 drop` → 把 `100.64.0.0/24` LAN 全部打死
+   （实测 713 个包被丢）。
+
+**为什么不能直接改 uci**：`fw_mode` 只有 `iptables` / `nftables` 是合法值；
+写 `off` 会让 tailscaled 回退去找 `iptables`（不存在）→ daemon 起不来；写 `noop` 同样起不来。
+
+**解决**：开机钩子 `files/etc/init.d/ts-coexist`（`START=99`）：
+等 tailscaled 就绪 → `tailscale set --netfilter-mode=off` → 清掉残留的
+`ip/ip6 filter|nat|mangle` 表 → 跑 `ts-addr-sync.sh` 补地址与 `100.64.0.0/10` 路由。
+
+**验证**：`NetfilterMode: 0`、`nft ... saddr 100.64` 计数 0、`nslookup @100.64.0.1` 正常、
+tailscale0 `100.78.25.13/32` 在。
+
 
 ## 注意 / 限制
 

@@ -1,0 +1,39 @@
+#!/bin/sh /etc/rc.common
+# ts-coexist: 开机后强制 tailscale 不管理防火墙 + 补地址/路由
+#
+# 为什么需要它（实测）：
+#   OpenWrt 的 /etc/init.d/tailscale 每次启动都会用
+#   TS_DEBUG_FIREWALL_MODE="<uci tailscale.settings.fw_mode>"（默认 nftables）
+#   拉起 tailscaled；而 prefs.NetfilterMode 不随 tailscaled.state 持久化。
+#   结果：重启后 netfilter 回到 on，tailscaled 重建反欺骗规则
+#     iifname != "tailscale0*" ip saddr 100.64.0.0/10 drop
+#   把 100.64.0.0/24 LAN（Tesla）整个打死 —— 车端表现为"WiFi 未连接到互联网"，
+#   连 DNS 到 100.64.0.1 都不通。
+#
+#   fw_mode 可选项只有 iptables / nftables（写 off/noop 会让 tailscaled 起不来
+#   或回退找 iptables 而失败），所以只能在服务起来后用 CLI 改 pref + 清表。
+#
+# 本脚本：等 tailscaled 就绪 → set --netfilter-mode=off → 清残留表 →
+#         ts-addr-sync.sh 补 tailscale0 地址与 100.64.0.0/10 路由。
+
+START=99
+STOP=10
+
+start() {
+	(
+		for i in $(seq 1 45); do
+			tailscale status >/dev/null 2>&1 && break
+			sleep 2
+		done
+		tailscale set --netfilter-mode=off >/dev/null 2>&1
+		sleep 2
+		for t in "ip filter" "ip6 filter" "ip nat" "ip6 nat" "ip mangle" "ip6 mangle"; do
+			nft list table $t >/dev/null 2>&1 && nft delete table $t >/dev/null 2>&1
+		done
+		/usr/libexec/ts-addr-sync.sh >/dev/null 2>&1
+	) >/dev/null 2>&1 &
+}
+
+stop() {
+	:
+}

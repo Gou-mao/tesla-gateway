@@ -50,6 +50,7 @@ tesla-gateway/
 ├── files/usr/libexec/tg-nft-status     # 只读 nft 状态 wrapper（给 LuCI ACL）
 ├── files/www/luci-static/resources/view/tesla-gateway/overview.js # LuCI 页面
 ├── files/usr/libexec/ts-addr-sync.sh   # Tailscale 共存：动态补 tun 地址 + 100.64/10 路由
+├── files/etc/init.d/ts-coexist         # 开机钩子：强制 netfilter=off + 清残留表 + 补地址
 ├── scripts/install-tailscale-coexist.sh # Tailscale 共存设备部署脚本
 ├── configs/config.example.yaml    # 开发机样例配置
 ├── scripts/deploy.sh              # 示例 scp 部署脚本（不硬编码密码）
